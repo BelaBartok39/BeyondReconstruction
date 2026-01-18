@@ -1,0 +1,91 @@
+# RF Anomaly Detection Configuration
+
+# Data settings
+data:
+  sequence_length: 1024        # Number of IQ samples per segment
+  sample_rate: 1e6             # Sample rate in Hz
+  num_train_samples: 10000     # Training samples
+  num_val_samples: 2000        # Validation samples
+  num_test_samples: 2000       # Test samples
+  anomaly_ratio: 0.1           # Fraction of anomalous samples in test set
+  snr_range: [-5, 30]          # SNR range in dB [min, max]
+  modulations:                 # Modulation types for normal signals
+    - bpsk
+    - qpsk
+    - qam16
+  anomaly_types:               # Types of anomalies to generate
+    - interference
+    - frequency_drift
+    - amplitude_spike
+    - phase_noise
+
+# Model settings
+model:
+  type: "snr_vae"              # Options: autoencoder, vae, snr_vae
+  latent_dim: 32               # Latent space dimension
+  hidden_channels: [32, 64, 128, 256]  # Encoder channel progression
+  kernel_size: 7               # Convolution kernel size
+  use_batch_norm: true         # Use batch normalization
+  dropout: 0.1                 # Dropout probability
+
+  # VAE-specific
+  beta: 1.0                    # Beta for KL divergence weighting
+
+  # SNR conditioning
+  snr_embedding_dim: 16        # Dimension of SNR embedding
+
+# Training settings
+training:
+  batch_size: 64
+  learning_rate: 1e-3
+  weight_decay: 1e-5
+  num_epochs: 100
+  early_stopping_patience: 10
+  gradient_clip_norm: 1.0
+  scheduler:
+    type: "cosine"             # Options: cosine, step, plateau
+    T_max: 100                 # For cosine scheduler
+    min_lr: 1e-6
+
+# Continuous learning settings
+continuous_learning:
+  # Online learning
+  online:
+    enabled: true
+    learning_rate: 1e-4        # Lower LR for online updates
+    update_frequency: 1        # Update every N batches
+
+  # Elastic Weight Consolidation
+  ewc:
+    enabled: true
+    lambda: 1000.0             # Fisher information regularization weight
+    fisher_samples: 1000       # Samples to compute Fisher information
+
+  # Periodic retraining
+  periodic:
+    enabled: true
+    interval: 1000             # Retrain every N samples
+    epochs_per_retrain: 5      # Epochs per retraining session
+
+  # Replay buffer
+  replay:
+    buffer_size: 5000          # Maximum samples in buffer
+    sample_strategy: "reservoir"  # Options: reservoir, fifo, stratified
+    replay_batch_ratio: 0.5    # Fraction of batch from replay buffer
+
+# Anomaly detection settings
+detection:
+  method: "hybrid"             # Options: reconstruction, latent, hybrid
+  threshold_method: "percentile"  # Options: fixed, percentile, adaptive
+  threshold_percentile: 95     # For percentile-based threshold
+  snr_adaptive: true           # Use SNR-adaptive thresholds
+  snr_bins: 7                  # Number of SNR bins for adaptive thresholds
+
+# Experiment settings
+experiment:
+  seed: 42
+  device: "auto"               # Options: auto, cuda, cpu
+  num_workers: 4
+  save_dir: "checkpoints"
+  log_interval: 100            # Log every N batches
+  checkpoint_interval: 10      # Save checkpoint every N epochs
