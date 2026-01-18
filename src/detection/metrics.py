@@ -77,72 +77,50 @@ def compute_metrics(
     Returns:
         MetricsResult with all metrics.
     """
-    # Ensure arrays
     scores = np.asarray(scores).flatten()
     labels = np.asarray(labels).flatten()
 
-    # Handle edge cases
+    # Handle edge case: all same class
     if len(np.unique(labels)) < 2:
-        # All same class - metrics undefined
         return MetricsResult(
             auroc=0.5,
-            auprc=float(np.mean(labels)),
-            f1=0.0,
-            precision=0.0,
-            recall=0.0,
+            auprc=float(labels.mean()),
+            f1=0.0, precision=0.0, recall=0.0,
             threshold=0.0,
-            accuracy=float(np.mean(labels == 0)),
-            true_positives=0,
-            false_positives=0,
-            true_negatives=int(np.sum(labels == 0)),
-            false_negatives=int(np.sum(labels == 1)),
+            accuracy=float((labels == 0).mean()),
+            true_positives=0, false_positives=0,
+            true_negatives=int((labels == 0).sum()),
+            false_negatives=int((labels == 1).sum()),
         )
 
-    # Compute ROC-AUC
+    # Compute ROC-AUC and PR-AUC
     auroc = roc_auc_score(labels, scores)
-
-    # Compute PR-AUC
     auprc = average_precision_score(labels, scores)
 
-    # Find optimal threshold if not provided
-    if threshold is None:
-        threshold = _find_optimal_threshold(scores, labels)
+    # Get threshold and predictions
+    threshold = threshold or _find_optimal_threshold(scores, labels)
+    predictions = predictions if predictions is not None else scores > threshold
 
-    # Get predictions
-    if predictions is None:
-        predictions = scores > threshold
-
-    # Compute confusion matrix
+    # Confusion matrix
     tn, fp, fn, tp = confusion_matrix(labels, predictions).ravel()
-
-    # Compute metrics
-    precision = precision_score(labels, predictions, zero_division=0)
-    recall = recall_score(labels, predictions, zero_division=0)
-    f1 = f1_score(labels, predictions, zero_division=0)
-    accuracy = (tp + tn) / (tp + tn + fp + fn)
-
-    # FPR at 95% TPR
-    fpr_at_95_tpr = _compute_fpr_at_tpr(scores, labels, target_tpr=0.95)
 
     return MetricsResult(
         auroc=float(auroc),
         auprc=float(auprc),
-        f1=float(f1),
-        precision=float(precision),
-        recall=float(recall),
+        f1=float(f1_score(labels, predictions, zero_division=0)),
+        precision=float(precision_score(labels, predictions, zero_division=0)),
+        recall=float(recall_score(labels, predictions, zero_division=0)),
         threshold=float(threshold),
-        accuracy=float(accuracy),
+        accuracy=float((tp + tn) / (tp + tn + fp + fn)),
         true_positives=int(tp),
         false_positives=int(fp),
         true_negatives=int(tn),
         false_negatives=int(fn),
-        fpr_at_95_tpr=fpr_at_95_tpr,
+        fpr_at_95_tpr=_compute_fpr_at_tpr(scores, labels, 0.95),
     )
 
 
-def _find_optimal_threshold(
-    scores: NDArray, labels: NDArray, metric: str = "f1"
-) -> float:
+def _find_optimal_threshold(scores: NDArray, labels: NDArray, metric: str = "f1") -> float:
     """Find threshold that optimizes given metric.
 
     Args:
@@ -155,32 +133,23 @@ def _find_optimal_threshold(
     """
     if metric == "f1":
         precisions, recalls, thresholds = precision_recall_curve(labels, scores)
-        # Avoid division by zero
+        if len(thresholds) == 0:
+            return float(np.median(scores))
         f1_scores = np.where(
             (precisions + recalls) > 0,
             2 * precisions * recalls / (precisions + recalls),
-            0,
+            0
         )
-        # Best threshold (thresholds array is one shorter)
-        if len(thresholds) > 0:
-            best_idx = np.argmax(f1_scores[:-1])
-            return float(thresholds[best_idx])
-        return float(np.median(scores))
+        return float(thresholds[np.argmax(f1_scores[:-1])])
 
-    elif metric == "youden":
-        # Youden's J statistic = TPR - FPR
+    if metric == "youden":
         fpr, tpr, thresholds = roc_curve(labels, scores)
-        j_scores = tpr - fpr
-        best_idx = np.argmax(j_scores)
-        return float(thresholds[best_idx])
+        return float(thresholds[np.argmax(tpr - fpr)])
 
-    else:
-        raise ValueError(f"Unknown metric: {metric}")
+    raise ValueError(f"Unknown metric: {metric}")
 
 
-def _compute_fpr_at_tpr(
-    scores: NDArray, labels: NDArray, target_tpr: float = 0.95
-) -> float | None:
+def _compute_fpr_at_tpr(scores: NDArray, labels: NDArray, target_tpr: float = 0.95) -> float | None:
     """Compute FPR at specified TPR level.
 
     Args:
@@ -192,12 +161,8 @@ def _compute_fpr_at_tpr(
         False positive rate at target TPR, or None if not achievable.
     """
     fpr, tpr, _ = roc_curve(labels, scores)
-
-    # Find FPR at target TPR
     idx = np.searchsorted(tpr, target_tpr)
-    if idx < len(fpr):
-        return float(fpr[idx])
-    return None
+    return float(fpr[idx]) if idx < len(fpr) else None
 
 
 @dataclass
@@ -221,13 +186,16 @@ class SNRStratifiedMetrics:
         aurocs = [m.auroc for m in self.metrics_per_bin if m.auroc > 0]
         f1s = [m.f1 for m in self.metrics_per_bin if m.f1 > 0]
 
+        def safe_stat(arr, func):
+            return float(func(arr)) if arr else 0.0
+
         return {
-            "mean_auroc": float(np.mean(aurocs)) if aurocs else 0.0,
-            "std_auroc": float(np.std(aurocs)) if aurocs else 0.0,
-            "mean_f1": float(np.mean(f1s)) if f1s else 0.0,
-            "std_f1": float(np.std(f1s)) if f1s else 0.0,
-            "min_auroc": float(np.min(aurocs)) if aurocs else 0.0,
-            "max_auroc": float(np.max(aurocs)) if aurocs else 0.0,
+            "mean_auroc": safe_stat(aurocs, np.mean),
+            "std_auroc": safe_stat(aurocs, np.std),
+            "mean_f1": safe_stat(f1s, np.mean),
+            "std_f1": safe_stat(f1s, np.std),
+            "min_auroc": safe_stat(aurocs, np.min),
+            "max_auroc": safe_stat(aurocs, np.max),
         }
 
 
@@ -255,48 +223,27 @@ def compute_snr_stratified_metrics(
     Returns:
         SNRStratifiedMetrics with per-bin results.
     """
-    snr_min, snr_max = snr_range
-    bin_edges = np.linspace(snr_min, snr_max, num_bins + 1)
-
-    snr_bins = []
-    metrics_per_bin = []
-    sample_counts = []
+    bin_edges = np.linspace(*snr_range, num_bins + 1)
+    snr_bins, metrics_per_bin, sample_counts = [], [], []
 
     for i in range(num_bins):
         bin_low, bin_high = bin_edges[i], bin_edges[i + 1]
         snr_bins.append((float(bin_low), float(bin_high)))
 
-        # Get samples in this bin
         mask = (snr_db >= bin_low) & (snr_db < bin_high)
-        sample_counts.append(int(np.sum(mask)))
+        sample_counts.append(int(mask.sum()))
 
-        if np.sum(mask) < 10 or len(np.unique(labels[mask])) < 2:
-            # Not enough samples or all same class
-            metrics_per_bin.append(
-                MetricsResult(
-                    auroc=0.5,
-                    auprc=0.0,
-                    f1=0.0,
-                    precision=0.0,
-                    recall=0.0,
-                    threshold=0.0,
-                    accuracy=0.0,
-                    true_positives=0,
-                    false_positives=0,
-                    true_negatives=0,
-                    false_negatives=0,
-                )
-            )
+        if mask.sum() < 10 or len(np.unique(labels[mask])) < 2:
+            metrics_per_bin.append(MetricsResult(
+                auroc=0.5, auprc=0.0, f1=0.0, precision=0.0, recall=0.0,
+                threshold=0.0, accuracy=0.0,
+                true_positives=0, false_positives=0, true_negatives=0, false_negatives=0,
+            ))
         else:
             bin_preds = predictions[mask] if predictions is not None else None
-            metrics = compute_metrics(scores[mask], labels[mask], bin_preds)
-            metrics_per_bin.append(metrics)
+            metrics_per_bin.append(compute_metrics(scores[mask], labels[mask], bin_preds))
 
-    return SNRStratifiedMetrics(
-        snr_bins=snr_bins,
-        metrics_per_bin=metrics_per_bin,
-        sample_counts=sample_counts,
-    )
+    return SNRStratifiedMetrics(snr_bins, metrics_per_bin, sample_counts)
 
 
 def compute_reconstruction_stats(
@@ -312,56 +259,47 @@ def compute_reconstruction_stats(
     Returns:
         Dictionary with statistics.
     """
-    normal_mask = labels == 0
-    anomaly_mask = labels == 1
+    normal_errors = reconstruction_errors[labels == 0]
+    anomaly_errors = reconstruction_errors[labels == 1]
 
-    normal_errors = reconstruction_errors[normal_mask]
-    anomaly_errors = reconstruction_errors[anomaly_mask]
+    def error_stats(errors):
+        """Compute stats for error array."""
+        if len(errors) == 0:
+            return {"mean": 0.0, "std": 0.0, "median": 0.0, "min": 0.0, "max": 0.0, "count": 0}
+        return {
+            "mean": float(errors.mean()),
+            "std": float(errors.std()),
+            "median": float(np.median(errors)),
+            "min": float(errors.min()),
+            "max": float(errors.max()),
+            "count": len(errors),
+        }
 
     stats = {
-        "normal": {
-            "mean": float(np.mean(normal_errors)),
-            "std": float(np.std(normal_errors)),
-            "median": float(np.median(normal_errors)),
-            "min": float(np.min(normal_errors)),
-            "max": float(np.max(normal_errors)),
-            "count": int(np.sum(normal_mask)),
-        },
-        "anomaly": {
-            "mean": float(np.mean(anomaly_errors)) if len(anomaly_errors) > 0 else 0,
-            "std": float(np.std(anomaly_errors)) if len(anomaly_errors) > 0 else 0,
-            "median": float(np.median(anomaly_errors)) if len(anomaly_errors) > 0 else 0,
-            "min": float(np.min(anomaly_errors)) if len(anomaly_errors) > 0 else 0,
-            "max": float(np.max(anomaly_errors)) if len(anomaly_errors) > 0 else 0,
-            "count": int(np.sum(anomaly_mask)),
-        },
+        "normal": error_stats(normal_errors),
+        "anomaly": error_stats(anomaly_errors),
     }
 
     # Separation metrics
     if len(anomaly_errors) > 0 and len(normal_errors) > 0:
-        # Cohen's d (effect size)
-        pooled_std = np.sqrt(
-            (np.std(normal_errors) ** 2 + np.std(anomaly_errors) ** 2) / 2
+        pooled_std = np.sqrt((normal_errors.std() ** 2 + anomaly_errors.std() ** 2) / 2)
+        stats["cohens_d"] = (
+            float((anomaly_errors.mean() - normal_errors.mean()) / pooled_std)
+            if pooled_std > 0 else 0.0
         )
-        if pooled_std > 0:
-            stats["cohens_d"] = float(
-                (np.mean(anomaly_errors) - np.mean(normal_errors)) / pooled_std
-            )
-        else:
-            stats["cohens_d"] = 0.0
 
         # Overlap coefficient
         from scipy.stats import gaussian_kde
-
         try:
-            kde_normal = gaussian_kde(normal_errors)
-            kde_anomaly = gaussian_kde(anomaly_errors)
             x = np.linspace(
                 min(normal_errors.min(), anomaly_errors.min()),
                 max(normal_errors.max(), anomaly_errors.max()),
-                1000,
+                1000
             )
-            overlap = np.trapz(np.minimum(kde_normal(x), kde_anomaly(x)), x)
+            overlap = np.trapz(
+                np.minimum(gaussian_kde(normal_errors)(x), gaussian_kde(anomaly_errors)(x)),
+                x
+            )
             stats["distribution_overlap"] = float(overlap)
         except Exception:
             stats["distribution_overlap"] = None

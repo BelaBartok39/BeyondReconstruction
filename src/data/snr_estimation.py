@@ -7,6 +7,24 @@ from numpy.typing import NDArray
 import torch
 
 
+def _to_complex(iq: NDArray[np.float32] | torch.Tensor) -> NDArray[np.complex128]:
+    """Convert IQ signal to complex numpy array.
+
+    Args:
+        iq: IQ signal as tensor or numpy array.
+
+    Returns:
+        Complex numpy array.
+    """
+    if isinstance(iq, torch.Tensor):
+        iq = iq.detach().cpu().numpy()
+
+    if iq.ndim == 2 and iq.shape[0] == 2:
+        return iq[0] + 1j * iq[1]
+
+    return iq.astype(np.complex128)
+
+
 def estimate_snr(
     iq: NDArray[np.float32] | torch.Tensor,
     method: str = "m2m4",
@@ -20,24 +38,18 @@ def estimate_snr(
     Returns:
         Estimated SNR in dB.
     """
-    # Convert to numpy if tensor
-    if isinstance(iq, torch.Tensor):
-        iq = iq.detach().cpu().numpy()
+    signal = _to_complex(iq)
 
-    # Convert to complex if [2, seq_len] format
-    if iq.ndim == 2 and iq.shape[0] == 2:
-        signal = iq[0] + 1j * iq[1]
-    else:
-        signal = iq
+    estimators = {
+        "m2m4": _estimate_snr_m2m4,
+        "wavelet": _estimate_snr_wavelet,
+        "spectral": _estimate_snr_spectral,
+    }
 
-    if method == "m2m4":
-        return _estimate_snr_m2m4(signal)
-    elif method == "wavelet":
-        return _estimate_snr_wavelet(signal)
-    elif method == "spectral":
-        return _estimate_snr_spectral(signal)
-    else:
+    if method not in estimators:
         raise ValueError(f"Unknown SNR estimation method: {method}")
+
+    return estimators[method](signal)
 
 
 def estimate_snr_batch(
@@ -56,12 +68,7 @@ def estimate_snr_batch(
     if isinstance(iq_batch, torch.Tensor):
         iq_batch = iq_batch.detach().cpu().numpy()
 
-    snr_values = np.array([
-        estimate_snr(iq_batch[i], method=method)
-        for i in range(len(iq_batch))
-    ], dtype=np.float32)
-
-    return snr_values
+    return np.array([estimate_snr(iq_batch[i], method) for i in range(len(iq_batch))], dtype=np.float32)
 
 
 def _estimate_snr_m2m4(signal: NDArray[np.complex128]) -> float:
@@ -80,34 +87,20 @@ def _estimate_snr_m2m4(signal: NDArray[np.complex128]) -> float:
     Returns:
         Estimated SNR in dB.
     """
-    # Compute moments
     m2 = np.mean(np.abs(signal) ** 2)
     m4 = np.mean(np.abs(signal) ** 4)
-
-    # For constant modulus signals (BPSK, QPSK)
-    # Kurtosis-based estimate
     kappa = m4 / (m2 ** 2)
 
-    # For QPSK, signal kurtosis is 1, noise kurtosis is 2
-    # kappa = (S^2 + 2*S*N + 2*N^2) / (S + N)^2
-    # Solving for SNR = S/N
-
-    # Simplified estimation assuming signal kurtosis ≈ 1
+    # Kurtosis-based SNR estimation
+    # For QPSK: signal kurtosis ≈ 1, noise kurtosis = 2
     if kappa >= 2:
-        # Very low SNR regime
-        snr_linear = 0.01
+        snr_linear = 0.01  # Very low SNR
     elif kappa <= 1:
-        # Very high SNR regime
-        snr_linear = 100
+        snr_linear = 100  # Very high SNR
     else:
-        # Estimate based on kurtosis
-        # Derived from: kappa = (1 + 2/SNR + 2/SNR^2) / (1 + 1/SNR)^2
-        # Approximate solution
-        snr_linear = 2 / (kappa - 1) - 1
-        snr_linear = max(snr_linear, 0.01)
+        snr_linear = max(2 / (kappa - 1) - 1, 0.01)
 
-    snr_db = 10 * np.log10(snr_linear)
-    return float(np.clip(snr_db, -10, 40))
+    return float(np.clip(10 * np.log10(snr_linear), -10, 40))
 
 
 def _estimate_snr_wavelet(signal: NDArray[np.complex128]) -> float:
@@ -122,27 +115,20 @@ def _estimate_snr_wavelet(signal: NDArray[np.complex128]) -> float:
     Returns:
         Estimated SNR in dB.
     """
-    # Simple Haar wavelet decomposition (difference of adjacent samples)
+    # Haar wavelet decomposition (difference of adjacent samples)
     detail = signal[1:] - signal[:-1]
 
     # Estimate noise std using MAD (robust to outliers)
     mad = np.median(np.abs(detail - np.median(detail)))
-    noise_std = mad / 0.6745  # Scale factor for Gaussian
-
-    # Signal power
-    signal_power = np.mean(np.abs(signal) ** 2)
-
-    # Noise power (factor of 2 due to differencing)
-    noise_power = (noise_std ** 2) / 2
+    noise_power = (mad / 0.6745) ** 2 / 2  # Scale for Gaussian, adjust for differencing
 
     if noise_power < 1e-10:
-        return 40.0  # Very high SNR
+        return 40.0
 
-    snr_linear = (signal_power - noise_power) / noise_power
-    snr_linear = max(snr_linear, 0.01)
+    signal_power = np.mean(np.abs(signal) ** 2)
+    snr_linear = max((signal_power - noise_power) / noise_power, 0.01)
 
-    snr_db = 10 * np.log10(snr_linear)
-    return float(np.clip(snr_db, -10, 40))
+    return float(np.clip(10 * np.log10(snr_linear), -10, 40))
 
 
 def _estimate_snr_spectral(signal: NDArray[np.complex128]) -> float:
@@ -156,27 +142,20 @@ def _estimate_snr_spectral(signal: NDArray[np.complex128]) -> float:
     Returns:
         Estimated SNR in dB.
     """
-    # Compute FFT
     n = len(signal)
-    spectrum = np.fft.fft(signal)
-    power_spectrum = np.abs(spectrum) ** 2 / n
-
-    # Sort power values
+    power_spectrum = np.abs(np.fft.fft(signal)) ** 2 / n
     sorted_power = np.sort(power_spectrum)
 
-    # Estimate noise from lower 25% of spectrum (assumed noise floor)
+    # Estimate noise from lower 25%, signal from upper 25%
     noise_floor = np.mean(sorted_power[: n // 4])
-
-    # Estimate signal power from upper 25% minus noise
-    signal_power = np.mean(sorted_power[3 * n // 4 :]) - noise_floor
 
     if noise_floor < 1e-10:
         return 40.0
 
+    signal_power = np.mean(sorted_power[3 * n // 4 :]) - noise_floor
     snr_linear = max(signal_power / noise_floor, 0.01)
-    snr_db = 10 * np.log10(snr_linear)
 
-    return float(np.clip(snr_db, -10, 40))
+    return float(np.clip(10 * np.log10(snr_linear), -10, 40))
 
 
 def normalize_snr(snr_db: float | NDArray, snr_range: tuple[float, float] = (-5, 30)) -> float | NDArray:
@@ -189,9 +168,7 @@ def normalize_snr(snr_db: float | NDArray, snr_range: tuple[float, float] = (-5,
     Returns:
         Normalized SNR value(s) in [0, 1].
     """
-    min_snr, max_snr = snr_range
-    normalized = (snr_db - min_snr) / (max_snr - min_snr)
-    return np.clip(normalized, 0, 1)
+    return np.clip((snr_db - snr_range[0]) / (snr_range[1] - snr_range[0]), 0, 1)
 
 
 def denormalize_snr(snr_norm: float | NDArray, snr_range: tuple[float, float] = (-5, 30)) -> float | NDArray:
@@ -204,5 +181,4 @@ def denormalize_snr(snr_norm: float | NDArray, snr_range: tuple[float, float] = 
     Returns:
         SNR value(s) in dB.
     """
-    min_snr, max_snr = snr_range
-    return snr_norm * (max_snr - min_snr) + min_snr
+    return snr_norm * (snr_range[1] - snr_range[0]) + snr_range[0]

@@ -8,12 +8,17 @@ echo "Setting up RF Anomaly Detection environment..."
 
 # Load required modules
 module purge
-module load cuda/12.1
-module load anaconda3
+module load nvhpc/23.11
+module load python/3.10.13/gcc.8.5.0
+module load cuda/12.3
+module load cudnn/8.9.7.29
+
+# Deactivate any existing conda environment
+conda deactivate 2>/dev/null || true
 
 # Create virtual environment
-ENV_NAME="rf_anomaly_env"
-ENV_PATH="$HOME/$ENV_NAME"
+ENV_NAME="pythonGPU"
+ENV_PATH="/project/ndrdmond/$ENV_NAME"
 
 if [ -d "$ENV_PATH" ]; then
     echo "Environment already exists at $ENV_PATH"
@@ -32,7 +37,7 @@ pip install --upgrade pip
 
 # Install PyTorch with CUDA support
 echo "Installing PyTorch..."
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu123
 
 # Install other requirements
 echo "Installing requirements..."
@@ -49,5 +54,5 @@ python -c "import torch; print(f'CUDA version: {torch.version.cuda}')"
 echo ""
 echo "=========================================="
 echo "Environment setup complete!"
-echo "To activate: source ~/rf_anomaly_env/bin/activate"
+echo "To activate: source /project/ndrdmond/pythonGPU/bin/activate"
 echo "=========================================="

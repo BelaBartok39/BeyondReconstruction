@@ -21,72 +21,36 @@ class VAEEncoder(nn.Module):
         use_batch_norm: bool = True,
         dropout: float = 0.1,
     ):
-        """Initialize VAE encoder.
-
-        Args:
-            in_channels: Number of input channels (2 for IQ).
-            hidden_channels: List of hidden channel sizes.
-            latent_dim: Dimension of latent space.
-            kernel_size: Convolution kernel size.
-            use_batch_norm: Whether to use batch normalization.
-            dropout: Dropout probability.
-        """
         super().__init__()
-
-        if hidden_channels is None:
-            hidden_channels = [32, 64, 128, 256]
-
-        self.hidden_channels = hidden_channels
+        self.hidden_channels = hidden_channels or [32, 64, 128, 256]
         self.latent_dim = latent_dim
 
         # Build encoder layers
-        layers = []
-        prev_channels = in_channels
-
-        for i, out_channels in enumerate(hidden_channels):
-            layers.append(
-                ConvBlock(
-                    prev_channels,
-                    out_channels,
-                    kernel_size=kernel_size,
-                    stride=2,
-                    use_batch_norm=use_batch_norm,
-                    dropout=dropout if i < len(hidden_channels) - 1 else 0,
-                )
+        channels = [in_channels] + self.hidden_channels
+        self.conv_layers = nn.Sequential(*[
+            ConvBlock(
+                channels[i], channels[i + 1], kernel_size, stride=2,
+                use_batch_norm=use_batch_norm,
+                dropout=dropout if i < len(self.hidden_channels) - 1 else 0
             )
-            prev_channels = out_channels
+            for i in range(len(self.hidden_channels))
+        ])
 
-        self.conv_layers = nn.Sequential(*layers)
-
-        # Projection layers for mean and log-variance
+        # Projection layers (lazy initialization)
         self._mu_proj = None
         self._logvar_proj = None
-        self._flat_size = None
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
-        """Encode input to latent distribution parameters.
-
-        Args:
-            x: Input tensor [batch, 2, seq_len].
-
-        Returns:
-            Tuple of (mean, log_variance) each [batch, latent_dim].
-        """
-        h = self.conv_layers(x)
-
-        batch_size = h.size(0)
-        h_flat = h.view(batch_size, -1)
+        """Encode input to latent distribution parameters."""
+        h = self.conv_layers(x).flatten(1)
 
         # Lazy initialization
         if self._mu_proj is None:
-            self._flat_size = h_flat.size(1)
-            self._mu_proj = nn.Linear(self._flat_size, self.latent_dim).to(x.device)
-            self._logvar_proj = nn.Linear(self._flat_size, self.latent_dim).to(x.device)
+            flat_size = h.size(1)
+            self._mu_proj = nn.Linear(flat_size, self.latent_dim).to(x.device)
+            self._logvar_proj = nn.Linear(flat_size, self.latent_dim).to(x.device)
 
-        mu = self._mu_proj(h_flat)
-        logvar = self._logvar_proj(h_flat)
-
-        return mu, logvar
+        return self._mu_proj(h), self._logvar_proj(h)
 
 
 class VAEDecoder(nn.Module):
@@ -102,75 +66,41 @@ class VAEDecoder(nn.Module):
         use_batch_norm: bool = True,
         dropout: float = 0.1,
     ):
-        """Initialize VAE decoder.
-
-        Args:
-            latent_dim: Dimension of latent space.
-            hidden_channels: List of hidden channel sizes.
-            out_channels: Number of output channels (2 for IQ).
-            output_length: Target output sequence length.
-            kernel_size: Convolution kernel size.
-            use_batch_norm: Whether to use batch normalization.
-            dropout: Dropout probability.
-        """
         super().__init__()
-
-        if hidden_channels is None:
-            hidden_channels = [256, 128, 64, 32]
-
-        self.hidden_channels = hidden_channels
+        self.hidden_channels = hidden_channels or [256, 128, 64, 32]
         self.output_length = output_length
 
         # Calculate initial size
         self._init_length = output_length
-        for _ in hidden_channels:
+        for _ in self.hidden_channels:
             self._init_length = (self._init_length + 1) // 2
 
-        self._init_channels = hidden_channels[0]
-        flat_size = self._init_channels * self._init_length
-
+        self._init_channels = self.hidden_channels[0]
         self.latent_proj = nn.Sequential(
-            nn.Linear(latent_dim, flat_size),
+            nn.Linear(latent_dim, self._init_channels * self._init_length),
             nn.LeakyReLU(0.2, inplace=True),
         )
 
         # Build decoder layers
-        layers = []
-        prev_channels = hidden_channels[0]
-
-        for i, out_ch in enumerate(hidden_channels[1:]):
-            layers.append(
-                ConvTransposeBlock(
-                    prev_channels,
-                    out_ch,
-                    kernel_size=kernel_size,
-                    stride=2,
-                    use_batch_norm=use_batch_norm,
-                    dropout=dropout if i < len(hidden_channels) - 2 else 0,
-                )
+        channels = self.hidden_channels
+        self.conv_layers = nn.Sequential(*[
+            ConvTransposeBlock(
+                channels[i], channels[i + 1], kernel_size, stride=2,
+                use_batch_norm=use_batch_norm,
+                dropout=dropout if i < len(channels) - 2 else 0
             )
-            prev_channels = out_ch
-
-        self.conv_layers = nn.Sequential(*layers)
+            for i in range(len(channels) - 1)
+        ])
 
         # Final layer
         self.final_conv = nn.ConvTranspose1d(
-            prev_channels, out_channels, kernel_size, stride=2,
+            channels[-1], out_channels, kernel_size, stride=2,
             padding=kernel_size // 2, output_padding=1
         )
 
     def forward(self, z: Tensor) -> Tensor:
-        """Decode latent sample to signal.
-
-        Args:
-            z: Latent tensor [batch, latent_dim].
-
-        Returns:
-            Reconstructed signal [batch, 2, seq_len].
-        """
-        h = self.latent_proj(z)
-        h = h.view(-1, self._init_channels, self._init_length)
-
+        """Decode latent sample to signal."""
+        h = self.latent_proj(z).view(-1, self._init_channels, self._init_length)
         h = self.conv_layers(h)
         x_recon = self.final_conv(h)
 
@@ -181,6 +111,12 @@ class VAEDecoder(nn.Module):
             )
 
         return x_recon
+
+
+def _compute_kl_divergence(mu: Tensor, logvar: Tensor, reduce: bool = True) -> Tensor:
+    """Compute KL divergence from standard normal: KL(q(z|x) || N(0, I))."""
+    kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+    return kl.mean() if reduce else kl
 
 
 class ConvVAE(nn.Module):
@@ -206,22 +142,8 @@ class ConvVAE(nn.Module):
         dropout: float = 0.1,
         beta: float = 1.0,
     ):
-        """Initialize VAE.
-
-        Args:
-            latent_dim: Dimension of latent space.
-            sequence_length: Input sequence length.
-            hidden_channels: List of hidden channel sizes.
-            kernel_size: Convolution kernel size.
-            use_batch_norm: Whether to use batch normalization.
-            dropout: Dropout probability.
-            beta: Weight for KL divergence (beta-VAE).
-        """
         super().__init__()
-
-        if hidden_channels is None:
-            hidden_channels = [32, 64, 128, 256]
-
+        hidden_channels = hidden_channels or [32, 64, 128, 256]
         self.latent_dim = latent_dim
         self.sequence_length = sequence_length
         self.beta = beta
@@ -246,170 +168,70 @@ class ConvVAE(nn.Module):
         )
 
     def reparameterize(self, mu: Tensor, logvar: Tensor) -> Tensor:
-        """Reparameterization trick for sampling.
-
-        Args:
-            mu: Mean of latent distribution [batch, latent_dim].
-            logvar: Log variance of latent distribution [batch, latent_dim].
-
-        Returns:
-            Sampled latent vector [batch, latent_dim].
-        """
+        """Reparameterization trick for sampling."""
         if self.training:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            return mu + eps * std
-        else:
-            return mu  # Use mean during inference
+            return mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+        return mu  # Use mean during inference
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Forward pass through VAE.
-
-        Args:
-            x: Input IQ signal [batch, 2, seq_len].
-
-        Returns:
-            Tuple of (reconstructed, mean, log_variance, latent_sample).
-        """
+        """Forward pass through VAE."""
         mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
-        x_recon = self.decoder(z)
-        return x_recon, mu, logvar, z
+        return self.decoder(z), mu, logvar, z
 
     def encode(self, x: Tensor) -> tuple[Tensor, Tensor]:
-        """Encode input to latent distribution.
-
-        Args:
-            x: Input IQ signal [batch, 2, seq_len].
-
-        Returns:
-            Tuple of (mean, log_variance).
-        """
+        """Encode input to latent distribution."""
         return self.encoder(x)
 
     def decode(self, z: Tensor) -> Tensor:
-        """Decode latent sample.
-
-        Args:
-            z: Latent tensor [batch, latent_dim].
-
-        Returns:
-            Reconstructed signal [batch, 2, seq_len].
-        """
+        """Decode latent sample."""
         return self.decoder(z)
 
     def sample(self, num_samples: int, device: torch.device | None = None) -> Tensor:
-        """Sample from the prior distribution.
-
-        Args:
-            num_samples: Number of samples to generate.
-            device: Device to create samples on.
-
-        Returns:
-            Generated signals [num_samples, 2, seq_len].
-        """
-        if device is None:
-            device = next(self.parameters()).device
-
+        """Sample from the prior distribution."""
+        device = device or next(self.parameters()).device
         z = torch.randn(num_samples, self.latent_dim, device=device)
         return self.decode(z)
 
     def reconstruction_loss(self, x: Tensor, x_recon: Tensor) -> Tensor:
-        """Compute reconstruction loss (MSE).
-
-        Args:
-            x: Original signal.
-            x_recon: Reconstructed signal.
-
-        Returns:
-            Reconstruction loss.
-        """
+        """Compute reconstruction loss (MSE)."""
         return nn.functional.mse_loss(x_recon, x, reduction="mean")
 
     def kl_divergence(self, mu: Tensor, logvar: Tensor) -> Tensor:
-        """Compute KL divergence from standard normal.
+        """Compute KL divergence from standard normal."""
+        return _compute_kl_divergence(mu, logvar, reduce=True)
 
-        Args:
-            mu: Mean of latent distribution.
-            logvar: Log variance of latent distribution.
-
-        Returns:
-            KL divergence loss.
-        """
-        # KL(q(z|x) || p(z)) where p(z) = N(0, I)
-        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
-        return kl.mean()
-
-    def loss(
-        self,
-        x: Tensor,
-        x_recon: Tensor,
-        mu: Tensor,
-        logvar: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Compute total VAE loss.
-
-        Args:
-            x: Original signal.
-            x_recon: Reconstructed signal.
-            mu: Latent mean.
-            logvar: Latent log variance.
-
-        Returns:
-            Tuple of (total_loss, reconstruction_loss, kl_loss).
-        """
+    def loss(self, x: Tensor, x_recon: Tensor, mu: Tensor, logvar: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Compute total VAE loss."""
         recon_loss = self.reconstruction_loss(x, x_recon)
         kl_loss = self.kl_divergence(mu, logvar)
-        total_loss = recon_loss + self.beta * kl_loss
-        return total_loss, recon_loss, kl_loss
+        return recon_loss + self.beta * kl_loss, recon_loss, kl_loss
 
     def get_reconstruction_error(self, x: Tensor) -> Tensor:
-        """Get per-sample reconstruction error.
-
-        Args:
-            x: Input IQ signal [batch, 2, seq_len].
-
-        Returns:
-            Reconstruction error per sample [batch].
-        """
+        """Get per-sample reconstruction error."""
         x_recon, _, _, _ = self(x)
-        error = ((x - x_recon) ** 2).mean(dim=(1, 2))
-        return error
+        return ((x - x_recon) ** 2).mean(dim=(1, 2))
 
-    def get_anomaly_score(
-        self,
-        x: Tensor,
-        include_kl: bool = True,
-        num_samples: int = 1,
-    ) -> Tensor:
-        """Compute anomaly score combining reconstruction and KL divergence.
-
-        Args:
-            x: Input IQ signal [batch, 2, seq_len].
-            include_kl: Whether to include KL divergence in score.
-            num_samples: Number of samples for Monte Carlo estimate.
-
-        Returns:
-            Anomaly score per sample [batch].
-        """
+    def get_anomaly_score(self, x: Tensor, include_kl: bool = True, num_samples: int = 1) -> Tensor:
+        """Compute anomaly score combining reconstruction and KL divergence."""
         mu, logvar = self.encoder(x)
 
+        # Compute reconstruction error with optional Monte Carlo sampling
         if num_samples == 1:
             z = self.reparameterize(mu, logvar)
             x_recon = self.decoder(z)
             recon_error = ((x - x_recon) ** 2).mean(dim=(1, 2))
         else:
-            # Monte Carlo estimate
-            recon_errors = []
-            for _ in range(num_samples):
-                z = self.reparameterize(mu, logvar)
-                x_recon = self.decoder(z)
-                recon_errors.append(((x - x_recon) ** 2).mean(dim=(1, 2)))
-            recon_error = torch.stack(recon_errors).mean(dim=0)
+            # Vectorized Monte Carlo estimate
+            batch_size = x.size(0)
+            mu_expanded = mu.unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, mu.size(1))
+            logvar_expanded = logvar.unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, logvar.size(1))
+            z = self.reparameterize(mu_expanded, logvar_expanded)
+
+            x_expanded = x.unsqueeze(1).expand(-1, num_samples, -1, -1).reshape(-1, x.size(1), x.size(2))
+            x_recon = self.decoder(z)
+            recon_error = ((x_expanded - x_recon) ** 2).mean(dim=(1, 2)).view(batch_size, num_samples).mean(dim=1)
 
         if include_kl:
-            # Per-sample KL
-            kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
-            return recon_error + self.beta * kl
-        else:
-            return recon_error
+            return recon_error + self.beta * _compute_kl_divergence(mu, logvar, reduce=False)
+        return recon_error

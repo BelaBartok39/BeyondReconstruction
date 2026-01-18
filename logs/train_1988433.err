@@ -1,0 +1,2 @@
+cpu-bind=MASK - ig02, task  0  0 [2789975]: mask 0x55 set
+/var/spool/slurmd/job1988433/slurm_script: line 31: /project/ndrdmond/PythonGPU/bin/activate: No such file or directory

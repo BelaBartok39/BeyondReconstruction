@@ -3,12 +3,29 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import Callable
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.optim import Optimizer
+
+
+def _get_device(model: nn.Module, device: torch.device | str | None) -> torch.device:
+    """Get device, defaulting to model's device."""
+    if device is None:
+        return next(model.parameters()).device
+    return torch.device(device) if isinstance(device, str) else device
+
+
+def _detect_model_type(model: nn.Module) -> tuple[bool, bool]:
+    """Detect if model is SNR-conditioned and/or VAE.
+
+    Returns:
+        Tuple of (is_snr_conditioned, is_vae).
+    """
+    is_snr = hasattr(model, "encoder") and hasattr(model.encoder, "snr_embed")
+    is_vae = hasattr(model, "reparameterize")
+    return is_snr, is_vae
 
 
 class OnlineLearner:
@@ -58,32 +75,20 @@ class OnlineLearner:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.gradient_clip_norm = gradient_clip_norm
         self.loss_ema_decay = loss_ema_decay
+        self.device = _get_device(model, device)
 
-        if device is None:
-            device = next(model.parameters()).device
-        self.device = torch.device(device) if isinstance(device, str) else device
-
-        # Optimizer
-        if optimizer is None:
-            self.optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=learning_rate,
-                weight_decay=weight_decay,
-            )
-        else:
-            self.optimizer = optimizer
+        self.optimizer = optimizer or torch.optim.AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
 
         # State tracking
         self._update_count = 0
         self._batch_count = 0
         self._loss_ema = None
         self._accumulated_loss = 0.0
-
-        # Model type detection
-        self._is_snr_conditioned = hasattr(model, "encoder") and hasattr(
-            model.encoder, "snr_embed"
-        )
-        self._is_vae = hasattr(model, "reparameterize")
+        self._is_snr_conditioned, self._is_vae = _detect_model_type(model)
 
     def update(self, batch: dict[str, Tensor]) -> dict[str, float]:
         """Perform online update with a batch.
@@ -97,15 +102,12 @@ class OnlineLearner:
         self.model.train()
         self._batch_count += 1
 
-        # Check if we should update this batch
         if self._batch_count % self.update_frequency != 0:
             return {"skipped": True, "batch_count": self._batch_count}
 
-        # Move data to device
         iq = batch["iq"].to(self.device)
         snr = batch.get("snr")
-        if snr is not None:
-            snr = snr.to(self.device)
+        snr = snr.to(self.device) if snr is not None else None
 
         # Forward pass
         loss = self._compute_loss(iq, snr)
@@ -117,26 +119,19 @@ class OnlineLearner:
         self._accumulated_loss += loss.item()
 
         # Perform optimizer step if accumulated enough
-        if self._batch_count % (self.update_frequency * self.gradient_accumulation_steps) == 0:
-            # Gradient clipping
+        should_step = self._batch_count % (self.update_frequency * self.gradient_accumulation_steps) == 0
+        if should_step:
             if self.gradient_clip_norm is not None:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.gradient_clip_norm
-                )
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_norm)
 
             self.optimizer.step()
             self.optimizer.zero_grad()
 
             # Update EMA loss
             avg_loss = self._accumulated_loss / self.gradient_accumulation_steps
-            if self._loss_ema is None:
-                self._loss_ema = avg_loss
-            else:
-                self._loss_ema = (
-                    self.loss_ema_decay * self._loss_ema
-                    + (1 - self.loss_ema_decay) * avg_loss
-                )
-
+            self._loss_ema = avg_loss if self._loss_ema is None else (
+                self.loss_ema_decay * self._loss_ema + (1 - self.loss_ema_decay) * avg_loss
+            )
             self._accumulated_loss = 0.0
             self._update_count += 1
 
@@ -148,25 +143,13 @@ class OnlineLearner:
         }
 
     def _compute_loss(self, iq: Tensor, snr: Tensor | None) -> Tensor:
-        """Compute reconstruction loss.
-
-        Args:
-            iq: IQ signals.
-            snr: SNR values.
-
-        Returns:
-            Loss tensor.
-        """
-        if self._is_snr_conditioned and snr is not None:
-            x_recon, mu, logvar, _ = self.model(iq, snr)
-            loss, _, _ = self.model.loss(iq, x_recon, mu, logvar)
-        elif self._is_vae:
-            x_recon, mu, logvar, _ = self.model(iq)
+        """Compute reconstruction loss based on model type."""
+        if self._is_vae:
+            x_recon, mu, logvar, _ = self.model(iq, snr) if self._is_snr_conditioned and snr is not None else self.model(iq)
             loss, _, _ = self.model.loss(iq, x_recon, mu, logvar)
         else:
             x_recon, _ = self.model(iq)
             loss = self.model.reconstruction_loss(iq, x_recon)
-
         return loss
 
     def set_learning_rate(self, lr: float) -> None:
@@ -288,27 +271,18 @@ class GradientMonitor:
         self._param_norms = deque(maxlen=window_size)
 
     def record(self) -> dict[str, float]:
-        """Record current gradient statistics.
+        """Record current gradient statistics."""
+        grad_norm_sq = sum(p.grad.data.norm(2).item() ** 2 for p in self.model.parameters() if p.grad is not None)
+        param_norm_sq = sum(p.data.norm(2).item() ** 2 for p in self.model.parameters())
 
-        Returns:
-            Dictionary with gradient statistics.
-        """
-        total_norm = 0.0
-        param_norm = 0.0
+        grad_norm = grad_norm_sq ** 0.5
+        param_norm = param_norm_sq ** 0.5
 
-        for p in self.model.parameters():
-            if p.grad is not None:
-                total_norm += p.grad.data.norm(2).item() ** 2
-            param_norm += p.data.norm(2).item() ** 2
-
-        total_norm = total_norm ** 0.5
-        param_norm = param_norm ** 0.5
-
-        self._grad_norms.append(total_norm)
+        self._grad_norms.append(grad_norm)
         self._param_norms.append(param_norm)
 
         return {
-            "grad_norm": total_norm,
+            "grad_norm": grad_norm,
             "param_norm": param_norm,
             "grad_norm_mean": sum(self._grad_norms) / len(self._grad_norms),
             "grad_norm_max": max(self._grad_norms),

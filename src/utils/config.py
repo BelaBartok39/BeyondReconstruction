@@ -26,12 +26,29 @@ class Config:
         Args:
             config_dict: Dictionary with configuration values.
         """
-        self._config = config_dict or {}
-
-        # Convert nested dicts to Config objects
-        for key, value in self._config.items():
+        self._config = {}
+        for key, value in (config_dict or {}).items():
             if isinstance(value, dict):
                 self._config[key] = Config(value)
+            else:
+                self._config[key] = self._convert_value(value)
+
+    @staticmethod
+    def _convert_value(value: Any) -> Any:
+        """Convert string values that look like numbers to proper types.
+
+        Handles scientific notation (1e-3, 1e6) that YAML may parse as strings.
+        """
+        if not isinstance(value, str):
+            return value
+
+        # Try to convert to int or float
+        try:
+            if '.' in value or 'e' in value.lower():
+                return float(value)
+            return int(value)
+        except ValueError:
+            return value
 
     def __getattr__(self, name: str) -> Any:
         """Get config value via attribute access."""
@@ -48,9 +65,7 @@ class Config:
         if name.startswith("_"):
             super().__setattr__(name, value)
         else:
-            if isinstance(value, dict):
-                value = Config(value)
-            self._config[name] = value
+            self._config[name] = self._to_config(value)
 
     def __getitem__(self, key: str) -> Any:
         """Get config value via dictionary access."""
@@ -58,9 +73,14 @@ class Config:
 
     def __setitem__(self, key: str, value: Any) -> None:
         """Set config value via dictionary access."""
+        self._config[key] = self._to_config(value)
+
+    @classmethod
+    def _to_config(cls, value: Any) -> Any:
+        """Convert dict to Config, convert numeric strings to numbers."""
         if isinstance(value, dict):
-            value = Config(value)
-        self._config[key] = value
+            return Config(value)
+        return cls._convert_value(value)
 
     def __contains__(self, key: str) -> bool:
         """Check if key exists in config."""
@@ -88,13 +108,10 @@ class Config:
         Returns:
             Dictionary representation of configuration.
         """
-        result = {}
-        for key, value in self._config.items():
-            if isinstance(value, Config):
-                result[key] = value.to_dict()
-            else:
-                result[key] = value
-        return result
+        return {
+            key: value.to_dict() if isinstance(value, Config) else value
+            for key, value in self._config.items()
+        }
 
     def update(self, updates: dict[str, Any]) -> None:
         """Update configuration with new values.
@@ -103,15 +120,10 @@ class Config:
             updates: Dictionary of updates to apply.
         """
         for key, value in updates.items():
-            if isinstance(value, dict) and key in self._config:
-                if isinstance(self._config[key], Config):
-                    self._config[key].update(value)
-                else:
-                    self._config[key] = Config(value)
+            if isinstance(value, dict) and isinstance(self._config.get(key), Config):
+                self._config[key].update(value)
             else:
-                if isinstance(value, dict):
-                    value = Config(value)
-                self._config[key] = value
+                self._config[key] = self._to_config(value)
 
     def copy(self) -> Config:
         """Create a deep copy of the configuration.
@@ -137,14 +149,11 @@ def load_config(config_path: str | Path, overrides: dict[str, Any] | None = None
         yaml.YAMLError: If config file is invalid YAML.
     """
     config_path = Path(config_path)
-
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     with open(config_path) as f:
-        config_dict = yaml.safe_load(f)
-
-    config = Config(config_dict)
+        config = Config(yaml.safe_load(f))
 
     if overrides:
         config.update(overrides)

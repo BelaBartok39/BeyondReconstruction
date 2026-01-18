@@ -38,6 +38,7 @@ class SignalMetadata:
     is_anomaly: bool
     anomaly_type: str | None = None
     anomaly_params: dict | None = None
+    signal_power_db: float | None = None  # Power before normalization (dB)
 
 
 class SyntheticRFGenerator:
@@ -69,13 +70,13 @@ class SyntheticRFGenerator:
             carrier_freq: Carrier frequency offset in Hz.
             seed: Random seed for reproducibility.
         """
-        self.sequence_length = sequence_length
-        self.sample_rate = sample_rate
-        self.symbol_rate = symbol_rate
-        self.carrier_freq = carrier_freq
+        self.sequence_length = int(sequence_length)
+        self.sample_rate = float(sample_rate)
+        self.symbol_rate = float(symbol_rate)
+        self.carrier_freq = float(carrier_freq)
         self.rng = np.random.default_rng(seed)
 
-        self.samples_per_symbol = int(sample_rate / symbol_rate)
+        self.samples_per_symbol = int(self.sample_rate / self.symbol_rate)
 
         # Constellation mappings
         self._constellations = {
@@ -108,21 +109,15 @@ class SyntheticRFGenerator:
     def _qam16_constellation() -> NDArray[np.complex128]:
         """16-QAM constellation points."""
         levels = np.array([-3, -1, 1, 3])
-        constellation = []
-        for i in levels:
-            for q in levels:
-                constellation.append(i + 1j * q)
-        return np.array(constellation) / np.sqrt(10)  # Normalize power
+        i_vals, q_vals = np.meshgrid(levels, levels)
+        return (i_vals + 1j * q_vals).flatten() / np.sqrt(10)  # Normalize power
 
     @staticmethod
     def _qam64_constellation() -> NDArray[np.complex128]:
         """64-QAM constellation points."""
         levels = np.array([-7, -5, -3, -1, 1, 3, 5, 7])
-        constellation = []
-        for i in levels:
-            for q in levels:
-                constellation.append(i + 1j * q)
-        return np.array(constellation) / np.sqrt(42)  # Normalize power
+        i_vals, q_vals = np.meshgrid(levels, levels)
+        return (i_vals + 1j * q_vals).flatten() / np.sqrt(42)  # Normalize power
 
     def _generate_symbols(
         self, modulation: Modulation, num_symbols: int
@@ -164,12 +159,9 @@ class SyntheticRFGenerator:
         )
         t = t / self.samples_per_symbol
 
-        # Avoid division by zero
+        # Raised cosine filter with safe division
         eps = 1e-10
-        t_safe = np.where(np.abs(t) < eps, eps, t)
-        denom = 1 - (2 * beta * t_safe) ** 2
-        denom = np.where(np.abs(denom) < eps, eps, denom)
-
+        denom = np.maximum(1 - (2 * beta * np.maximum(np.abs(t), eps)) ** 2, eps)
         h = np.sinc(t) * np.cos(np.pi * beta * t) / denom
         h /= np.sqrt(np.sum(h**2))  # Normalize energy
 
@@ -190,8 +182,7 @@ class SyntheticRFGenerator:
             return signal
 
         t = np.arange(len(signal)) / self.sample_rate
-        carrier = np.exp(2j * np.pi * self.carrier_freq * t)
-        return signal * carrier
+        return signal * np.exp(2j * np.pi * self.carrier_freq * t)
 
     def _add_awgn(
         self, signal: NDArray[np.complex128], snr_db: float
@@ -216,6 +207,31 @@ class SyntheticRFGenerator:
 
         return signal + noise
 
+    def _normalize_signal(
+        self, signal: NDArray[np.complex128]
+    ) -> tuple[NDArray[np.complex128], float]:
+        """Ensure correct length and normalize signal.
+
+        Args:
+            signal: Input signal.
+
+        Returns:
+            Tuple of (normalized signal of correct length, power in dB before normalization).
+        """
+        # Trim or pad to sequence_length
+        if len(signal) > self.sequence_length:
+            signal = signal[: self.sequence_length]
+        elif len(signal) < self.sequence_length:
+            signal = np.pad(signal, (0, self.sequence_length - len(signal)))
+
+        # Compute power before normalization (in dB)
+        signal_power = np.mean(np.abs(signal) ** 2)
+        power_db = 10 * np.log10(signal_power + 1e-10)
+
+        # Normalize amplitude
+        normalized = signal / (np.max(np.abs(signal)) + 1e-8)
+        return normalized, power_db
+
     def generate_normal_signal(
         self,
         modulation: str | Modulation = "qpsk",
@@ -232,49 +248,33 @@ class SyntheticRFGenerator:
         Returns:
             Tuple of (IQ array [2, seq_len], metadata).
         """
-        if isinstance(modulation, str):
-            modulation = Modulation(modulation.lower())
+        modulation = Modulation(modulation.lower()) if isinstance(modulation, str) else modulation
+        snr_db = snr_db if snr_db is not None else self.rng.uniform(*snr_range)
 
-        if snr_db is None:
-            snr_db = self.rng.uniform(snr_range[0], snr_range[1])
-
-        # Generate enough symbols
+        # Generate, shape, and modulate signal
         num_symbols = self.sequence_length // self.samples_per_symbol + 10
         symbols = self._generate_symbols(modulation, num_symbols)
-
-        # Pulse shaping
         signal = self._pulse_shape(symbols)
-
-        # Add carrier
         signal = self._add_carrier(signal)
-
-        # Add noise
         signal = self._add_awgn(signal, snr_db)
+        signal, power_db = self._normalize_signal(signal)
 
-        # Ensure correct length
-        signal = signal[: self.sequence_length]
-        if len(signal) < self.sequence_length:
-            signal = np.pad(signal, (0, self.sequence_length - len(signal)))
-
-        # Normalize
-        signal = signal / (np.max(np.abs(signal)) + 1e-8)
-
-        # Convert to [2, seq_len] format (I and Q channels)
+        # Convert to [2, seq_len] IQ format
         iq = np.stack([signal.real, signal.imag], axis=0).astype(np.float32)
 
-        metadata = SignalMetadata(
+        return iq, SignalMetadata(
             modulation=modulation.value,
             snr_db=float(snr_db),
             is_anomaly=False,
+            signal_power_db=float(power_db),
         )
-
-        return iq, metadata
 
     def _add_interference(
         self,
         signal: NDArray[np.complex128],
         snr_db: float,
         sir_db: float | None = None,
+        severity: float = 1.0,
     ) -> tuple[NDArray[np.complex128], dict]:
         """Add narrowband interference.
 
@@ -282,25 +282,22 @@ class SyntheticRFGenerator:
             signal: Input signal.
             snr_db: Signal SNR (unused, kept for interface consistency).
             sir_db: Signal-to-interference ratio in dB.
+            severity: Anomaly severity (1.0=default, higher=stronger anomaly).
 
         Returns:
             Tuple of (corrupted signal, anomaly parameters).
         """
         if sir_db is None:
-            sir_db = self.rng.uniform(-5, 10)
+            # Lower SIR = stronger interference
+            sir_db = self.rng.uniform(-10 * severity, 5)
 
-        # Random interference frequency
+        # Generate scaled interference at random frequency
         freq_offset = self.rng.uniform(-0.4, 0.4) * self.sample_rate
-
-        # Generate interference
         t = np.arange(len(signal)) / self.sample_rate
-        interference = np.exp(2j * np.pi * freq_offset * t)
 
-        # Scale to desired SIR
         signal_power = np.mean(np.abs(signal) ** 2)
-        sir_linear = 10 ** (sir_db / 10)
-        interference_power = signal_power / sir_linear
-        interference *= np.sqrt(interference_power)
+        interference_power = signal_power / (10 ** (sir_db / 10))
+        interference = np.sqrt(interference_power) * np.exp(2j * np.pi * freq_offset * t)
 
         params = {"sir_db": sir_db, "frequency_offset_hz": freq_offset}
         return signal + interference, params
@@ -310,6 +307,7 @@ class SyntheticRFGenerator:
         signal: NDArray[np.complex128],
         snr_db: float,
         drift_rate: float | None = None,
+        severity: float = 1.0,
     ) -> tuple[NDArray[np.complex128], dict]:
         """Add frequency drift over time.
 
@@ -317,19 +315,18 @@ class SyntheticRFGenerator:
             signal: Input signal.
             snr_db: Signal SNR (unused).
             drift_rate: Drift rate in Hz/sample.
+            severity: Anomaly severity (1.0=default, higher=stronger anomaly).
 
         Returns:
             Tuple of (corrupted signal, anomaly parameters).
         """
-        if drift_rate is None:
-            drift_rate = self.rng.uniform(-10, 10)
+        # Increased drift rate range for more noticeable effect
+        drift_rate = drift_rate if drift_rate is not None else self.rng.uniform(-30 * severity, 30 * severity)
 
         t = np.arange(len(signal))
-        phase = 2 * np.pi * drift_rate * t**2 / (2 * self.sample_rate)
-        drift = np.exp(1j * phase)
+        phase = np.pi * drift_rate * t**2 / self.sample_rate
 
-        params = {"drift_rate_hz_per_sample": drift_rate}
-        return signal * drift, params
+        return signal * np.exp(1j * phase), {"drift_rate_hz_per_sample": drift_rate}
 
     def _add_amplitude_spike(
         self,
@@ -337,6 +334,7 @@ class SyntheticRFGenerator:
         snr_db: float,
         spike_amplitude: float | None = None,
         spike_duration: int | None = None,
+        severity: float = 1.0,
     ) -> tuple[NDArray[np.complex128], dict]:
         """Add amplitude spike/burst.
 
@@ -345,33 +343,31 @@ class SyntheticRFGenerator:
             snr_db: Signal SNR (unused).
             spike_amplitude: Relative spike amplitude.
             spike_duration: Duration of spike in samples.
+            severity: Anomaly severity (1.0=default, higher=stronger anomaly).
 
         Returns:
             Tuple of (corrupted signal, anomaly parameters).
         """
-        if spike_amplitude is None:
-            spike_amplitude = self.rng.uniform(2, 5)
-        if spike_duration is None:
-            spike_duration = self.rng.integers(10, 100)
-
-        # Random spike location
+        # Increased amplitude range for more noticeable spikes
+        spike_amplitude = spike_amplitude if spike_amplitude is not None else self.rng.uniform(3 * severity, 10 * severity)
+        spike_duration = spike_duration if spike_duration is not None else self.rng.integers(20, 200)
         spike_start = self.rng.integers(0, len(signal) - spike_duration)
 
         corrupted = signal.copy()
         corrupted[spike_start : spike_start + spike_duration] *= spike_amplitude
 
-        params = {
+        return corrupted, {
             "spike_amplitude": spike_amplitude,
             "spike_duration": spike_duration,
             "spike_start": spike_start,
         }
-        return corrupted, params
 
     def _add_phase_noise(
         self,
         signal: NDArray[np.complex128],
         snr_db: float,
         noise_std: float | None = None,
+        severity: float = 1.0,
     ) -> tuple[NDArray[np.complex128], dict]:
         """Add random phase noise.
 
@@ -379,21 +375,18 @@ class SyntheticRFGenerator:
             signal: Input signal.
             snr_db: Signal SNR (unused).
             noise_std: Standard deviation of phase noise in radians.
+            severity: Anomaly severity (1.0=default, higher=stronger anomaly).
 
         Returns:
             Tuple of (corrupted signal, anomaly parameters).
         """
-        if noise_std is None:
-            noise_std = self.rng.uniform(0.3, 1.0)
+        # Increased phase noise for more noticeable effect
+        noise_std = noise_std if noise_std is not None else self.rng.uniform(0.5 * severity, 2.0 * severity)
 
         # Generate correlated phase noise (random walk)
-        phase_increments = self.rng.normal(0, noise_std, len(signal))
-        phase_noise = np.cumsum(phase_increments)
+        phase_noise = np.cumsum(self.rng.normal(0, noise_std, len(signal)))
 
-        corrupted = signal * np.exp(1j * phase_noise)
-
-        params = {"phase_noise_std": noise_std}
-        return corrupted, params
+        return signal * np.exp(1j * phase_noise), {"phase_noise_std": noise_std}
 
     def _add_burst_noise(
         self,
@@ -401,6 +394,7 @@ class SyntheticRFGenerator:
         snr_db: float,
         burst_snr: float | None = None,
         num_bursts: int | None = None,
+        severity: float = 1.0,
     ) -> tuple[NDArray[np.complex128], dict]:
         """Add impulsive burst noise.
 
@@ -409,26 +403,23 @@ class SyntheticRFGenerator:
             snr_db: Signal SNR (unused).
             burst_snr: SNR during bursts in dB.
             num_bursts: Number of burst events.
+            severity: Anomaly severity (1.0=default, higher=stronger anomaly).
 
         Returns:
             Tuple of (corrupted signal, anomaly parameters).
         """
-        if burst_snr is None:
-            burst_snr = self.rng.uniform(-10, 0)
-        if num_bursts is None:
-            num_bursts = self.rng.integers(1, 5)
+        # Lower burst SNR = more noise, more bursts
+        burst_snr = burst_snr if burst_snr is not None else self.rng.uniform(-20 * severity, -5)
+        num_bursts = num_bursts if num_bursts is not None else self.rng.integers(2, 8)
 
         corrupted = signal.copy()
         burst_params = []
+        signal_power = np.mean(np.abs(signal) ** 2)
+        burst_power = signal_power / (10 ** (burst_snr / 10))
 
         for _ in range(num_bursts):
             burst_duration = self.rng.integers(5, 50)
             burst_start = self.rng.integers(0, len(signal) - burst_duration)
-
-            # Add burst noise
-            signal_power = np.mean(np.abs(signal) ** 2)
-            burst_snr_linear = 10 ** (burst_snr / 10)
-            burst_power = signal_power / burst_snr_linear
 
             burst_noise = np.sqrt(burst_power / 2) * (
                 self.rng.standard_normal(burst_duration)
@@ -436,16 +427,13 @@ class SyntheticRFGenerator:
             )
 
             corrupted[burst_start : burst_start + burst_duration] += burst_noise
-            burst_params.append(
-                {"start": burst_start, "duration": burst_duration}
-            )
+            burst_params.append({"start": burst_start, "duration": burst_duration})
 
-        params = {
+        return corrupted, {
             "burst_snr_db": burst_snr,
             "num_bursts": num_bursts,
             "bursts": burst_params,
         }
-        return corrupted, params
 
     def generate_anomaly(
         self,
@@ -467,48 +455,39 @@ class SyntheticRFGenerator:
         Returns:
             Tuple of (IQ array [2, seq_len], metadata).
         """
+        # Parse inputs
         if anomaly_type is None:
             anomaly_type = self.rng.choice(list(AnomalyType))
-        elif isinstance(anomaly_type, str):
-            anomaly_type = AnomalyType(anomaly_type.lower())
+        else:
+            anomaly_type = AnomalyType(anomaly_type.lower()) if isinstance(anomaly_type, str) else anomaly_type
 
-        if isinstance(base_modulation, str):
-            base_modulation = Modulation(base_modulation.lower())
+        base_modulation = Modulation(base_modulation.lower()) if isinstance(base_modulation, str) else base_modulation
+        snr_db = snr_db if snr_db is not None else self.rng.uniform(*snr_range)
 
-        if snr_db is None:
-            snr_db = self.rng.uniform(snr_range[0], snr_range[1])
-
-        # Generate base signal
+        # Generate base signal with anomaly
         num_symbols = self.sequence_length // self.samples_per_symbol + 10
         symbols = self._generate_symbols(base_modulation, num_symbols)
         signal = self._pulse_shape(symbols)
         signal = self._add_carrier(signal)
 
-        # Apply anomaly before noise (more realistic)
+        # Apply anomaly before noise
         anomaly_func = self._anomaly_generators[anomaly_type]
         signal, anomaly_params = anomaly_func(signal, snr_db, **anomaly_kwargs)
 
-        # Add noise
         signal = self._add_awgn(signal, snr_db)
+        signal, power_db = self._normalize_signal(signal)
 
-        # Ensure correct length and normalize
-        signal = signal[: self.sequence_length]
-        if len(signal) < self.sequence_length:
-            signal = np.pad(signal, (0, self.sequence_length - len(signal)))
-        signal = signal / (np.max(np.abs(signal)) + 1e-8)
-
-        # Convert to [2, seq_len] format
+        # Convert to [2, seq_len] IQ format
         iq = np.stack([signal.real, signal.imag], axis=0).astype(np.float32)
 
-        metadata = SignalMetadata(
+        return iq, SignalMetadata(
             modulation=base_modulation.value,
             snr_db=float(snr_db),
             is_anomaly=True,
             anomaly_type=anomaly_type.value,
             anomaly_params=anomaly_params,
+            signal_power_db=float(power_db),
         )
-
-        return iq, metadata
 
     def generate_batch(
         self,

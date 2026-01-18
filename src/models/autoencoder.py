@@ -7,6 +7,53 @@ import torch.nn as nn
 from torch import Tensor
 
 
+def _build_conv_layers(
+    conv_cls: type,
+    in_channels: int,
+    out_channels: int,
+    kernel_size: int,
+    stride: int,
+    padding: int,
+    output_padding: int = 0,
+    use_batch_norm: bool = True,
+    dropout: float = 0.0,
+    activation: nn.Module | None = None,
+) -> nn.Sequential:
+    """Build convolutional layer sequence with normalization and dropout.
+
+    Args:
+        conv_cls: Conv1d or ConvTranspose1d class.
+        in_channels: Input channels.
+        out_channels: Output channels.
+        kernel_size: Convolution kernel size.
+        stride: Convolution stride.
+        padding: Padding size.
+        output_padding: Output padding for transpose convolutions.
+        use_batch_norm: Whether to use batch normalization.
+        dropout: Dropout probability.
+        activation: Activation function (default: LeakyReLU).
+
+    Returns:
+        Sequential module with conv, optional batchnorm, activation, and dropout.
+    """
+    layers = []
+
+    if conv_cls == nn.ConvTranspose1d:
+        layers.append(conv_cls(in_channels, out_channels, kernel_size, stride, padding, output_padding))
+    else:
+        layers.append(conv_cls(in_channels, out_channels, kernel_size, stride, padding))
+
+    if use_batch_norm:
+        layers.append(nn.BatchNorm1d(out_channels))
+
+    layers.append(activation or nn.LeakyReLU(0.2, inplace=True))
+
+    if dropout > 0:
+        layers.append(nn.Dropout(dropout))
+
+    return nn.Sequential(*layers)
+
+
 class ConvBlock(nn.Module):
     """Convolutional block with optional batch norm and dropout."""
 
@@ -21,41 +68,13 @@ class ConvBlock(nn.Module):
         dropout: float = 0.0,
         activation: nn.Module | None = None,
     ):
-        """Initialize convolutional block.
-
-        Args:
-            in_channels: Input channels.
-            out_channels: Output channels.
-            kernel_size: Convolution kernel size.
-            stride: Convolution stride.
-            padding: Padding (auto-calculated if None).
-            use_batch_norm: Whether to use batch normalization.
-            dropout: Dropout probability.
-            activation: Activation function (default: LeakyReLU).
-        """
         super().__init__()
-
-        if padding is None:
-            padding = kernel_size // 2
-
-        layers = [
-            nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding)
-        ]
-
-        if use_batch_norm:
-            layers.append(nn.BatchNorm1d(out_channels))
-
-        if activation is None:
-            activation = nn.LeakyReLU(0.2, inplace=True)
-        layers.append(activation)
-
-        if dropout > 0:
-            layers.append(nn.Dropout(dropout))
-
-        self.block = nn.Sequential(*layers)
+        self.block = _build_conv_layers(
+            nn.Conv1d, in_channels, out_channels, kernel_size, stride,
+            padding or kernel_size // 2, 0, use_batch_norm, dropout, activation
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        """Forward pass."""
         return self.block(x)
 
 
@@ -74,44 +93,13 @@ class ConvTransposeBlock(nn.Module):
         dropout: float = 0.0,
         activation: nn.Module | None = None,
     ):
-        """Initialize transposed convolutional block.
-
-        Args:
-            in_channels: Input channels.
-            out_channels: Output channels.
-            kernel_size: Convolution kernel size.
-            stride: Convolution stride.
-            padding: Padding (auto-calculated if None).
-            output_padding: Output padding for size matching.
-            use_batch_norm: Whether to use batch normalization.
-            dropout: Dropout probability.
-            activation: Activation function (default: LeakyReLU).
-        """
         super().__init__()
-
-        if padding is None:
-            padding = kernel_size // 2
-
-        layers = [
-            nn.ConvTranspose1d(
-                in_channels, out_channels, kernel_size, stride, padding, output_padding
-            )
-        ]
-
-        if use_batch_norm:
-            layers.append(nn.BatchNorm1d(out_channels))
-
-        if activation is None:
-            activation = nn.LeakyReLU(0.2, inplace=True)
-        layers.append(activation)
-
-        if dropout > 0:
-            layers.append(nn.Dropout(dropout))
-
-        self.block = nn.Sequential(*layers)
+        self.block = _build_conv_layers(
+            nn.ConvTranspose1d, in_channels, out_channels, kernel_size, stride,
+            padding or kernel_size // 2, output_padding, use_batch_norm, dropout, activation
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        """Forward pass."""
         return self.block(x)
 
 
@@ -127,84 +115,41 @@ class Encoder(nn.Module):
         use_batch_norm: bool = True,
         dropout: float = 0.1,
     ):
-        """Initialize encoder.
-
-        Args:
-            in_channels: Number of input channels (2 for IQ).
-            hidden_channels: List of hidden channel sizes.
-            latent_dim: Dimension of latent space.
-            kernel_size: Convolution kernel size.
-            use_batch_norm: Whether to use batch normalization.
-            dropout: Dropout probability.
-        """
         super().__init__()
-
-        if hidden_channels is None:
-            hidden_channels = [32, 64, 128, 256]
-
-        self.hidden_channels = hidden_channels
+        self.hidden_channels = hidden_channels or [32, 64, 128, 256]
         self.latent_dim = latent_dim
 
         # Build encoder layers
-        layers = []
-        prev_channels = in_channels
-
-        for i, out_channels in enumerate(hidden_channels):
-            layers.append(
-                ConvBlock(
-                    prev_channels,
-                    out_channels,
-                    kernel_size=kernel_size,
-                    stride=2,
-                    use_batch_norm=use_batch_norm,
-                    dropout=dropout if i < len(hidden_channels) - 1 else 0,
-                )
+        channels = [in_channels] + self.hidden_channels
+        self.conv_layers = nn.Sequential(*[
+            ConvBlock(
+                channels[i], channels[i + 1], kernel_size, stride=2,
+                use_batch_norm=use_batch_norm,
+                dropout=dropout if i < len(self.hidden_channels) - 1 else 0
             )
-            prev_channels = out_channels
+            for i in range(len(self.hidden_channels))
+        ])
 
-        self.conv_layers = nn.Sequential(*layers)
-
-        # Latent projection (will be set after first forward pass)
+        # Latent projection (lazy initialization)
         self._latent_proj = None
         self._flat_size = None
 
     def forward(self, x: Tensor) -> Tensor:
-        """Encode input to latent space.
-
-        Args:
-            x: Input tensor [batch, 2, seq_len].
-
-        Returns:
-            Latent representation [batch, latent_dim].
-        """
-        # Convolutional encoding
-        h = self.conv_layers(x)
-
-        # Flatten
-        batch_size = h.size(0)
-        h_flat = h.view(batch_size, -1)
+        """Encode input to latent space."""
+        h = self.conv_layers(x).flatten(1)
 
         # Lazy initialization of projection layer
         if self._latent_proj is None:
-            self._flat_size = h_flat.size(1)
+            self._flat_size = h.size(1)
             self._latent_proj = nn.Linear(self._flat_size, self.latent_dim).to(x.device)
 
-        z = self._latent_proj(h_flat)
-        return z
+        return self._latent_proj(h)
 
     def get_output_shape(self, input_length: int) -> tuple[int, int]:
-        """Calculate encoder output shape before flattening.
-
-        Args:
-            input_length: Input sequence length.
-
-        Returns:
-            Tuple of (channels, length) after conv layers.
-        """
+        """Calculate encoder output shape before flattening."""
         length = input_length
         for _ in self.hidden_channels:
             length = (length + 1) // 2  # stride=2 with padding
-
         return (self.hidden_channels[-1], length)
 
 
@@ -221,73 +166,38 @@ class Decoder(nn.Module):
         use_batch_norm: bool = True,
         dropout: float = 0.1,
     ):
-        """Initialize decoder.
-
-        Args:
-            latent_dim: Dimension of latent space.
-            hidden_channels: List of hidden channel sizes (reverse of encoder).
-            out_channels: Number of output channels (2 for IQ).
-            output_length: Target output sequence length.
-            kernel_size: Convolution kernel size.
-            use_batch_norm: Whether to use batch normalization.
-            dropout: Dropout probability.
-        """
         super().__init__()
-
-        if hidden_channels is None:
-            hidden_channels = [256, 128, 64, 32]
-
-        self.hidden_channels = hidden_channels
+        self.hidden_channels = hidden_channels or [256, 128, 64, 32]
         self.output_length = output_length
 
         # Calculate initial size for latent projection
         self._init_length = output_length
-        for _ in hidden_channels:
+        for _ in self.hidden_channels:
             self._init_length = (self._init_length + 1) // 2
 
-        self._init_channels = hidden_channels[0]
-        flat_size = self._init_channels * self._init_length
-
-        self.latent_proj = nn.Linear(latent_dim, flat_size)
+        self._init_channels = self.hidden_channels[0]
+        self.latent_proj = nn.Linear(latent_dim, self._init_channels * self._init_length)
 
         # Build decoder layers
-        layers = []
-        prev_channels = hidden_channels[0]
-
-        for i, out_ch in enumerate(hidden_channels[1:]):
-            layers.append(
-                ConvTransposeBlock(
-                    prev_channels,
-                    out_ch,
-                    kernel_size=kernel_size,
-                    stride=2,
-                    use_batch_norm=use_batch_norm,
-                    dropout=dropout if i < len(hidden_channels) - 2 else 0,
-                )
+        channels = self.hidden_channels
+        self.conv_layers = nn.Sequential(*[
+            ConvTransposeBlock(
+                channels[i], channels[i + 1], kernel_size, stride=2,
+                use_batch_norm=use_batch_norm,
+                dropout=dropout if i < len(channels) - 2 else 0
             )
-            prev_channels = out_ch
-
-        self.conv_layers = nn.Sequential(*layers)
+            for i in range(len(channels) - 1)
+        ])
 
         # Final layer without activation
         self.final_conv = nn.ConvTranspose1d(
-            prev_channels, out_channels, kernel_size, stride=2, padding=kernel_size // 2, output_padding=1
+            channels[-1], out_channels, kernel_size, stride=2,
+            padding=kernel_size // 2, output_padding=1
         )
 
     def forward(self, z: Tensor) -> Tensor:
-        """Decode latent representation to signal.
-
-        Args:
-            z: Latent tensor [batch, latent_dim].
-
-        Returns:
-            Reconstructed signal [batch, 2, seq_len].
-        """
-        # Project and reshape
-        h = self.latent_proj(z)
-        h = h.view(-1, self._init_channels, self._init_length)
-
-        # Convolutional decoding
+        """Decode latent representation to signal."""
+        h = self.latent_proj(z).view(-1, self._init_channels, self._init_length)
         h = self.conv_layers(h)
         x_recon = self.final_conv(h)
 
@@ -323,21 +233,8 @@ class ConvAutoencoder(nn.Module):
         use_batch_norm: bool = True,
         dropout: float = 0.1,
     ):
-        """Initialize autoencoder.
-
-        Args:
-            latent_dim: Dimension of latent space.
-            sequence_length: Input sequence length.
-            hidden_channels: List of hidden channel sizes for encoder.
-            kernel_size: Convolution kernel size.
-            use_batch_norm: Whether to use batch normalization.
-            dropout: Dropout probability.
-        """
         super().__init__()
-
-        if hidden_channels is None:
-            hidden_channels = [32, 64, 128, 256]
-
+        hidden_channels = hidden_channels or [32, 64, 128, 256]
         self.latent_dim = latent_dim
         self.sequence_length = sequence_length
 
@@ -352,7 +249,7 @@ class ConvAutoencoder(nn.Module):
 
         self.decoder = Decoder(
             latent_dim=latent_dim,
-            hidden_channels=hidden_channels[::-1],  # Reverse for decoder
+            hidden_channels=hidden_channels[::-1],
             out_channels=2,
             output_length=sequence_length,
             kernel_size=kernel_size,
@@ -361,68 +258,23 @@ class ConvAutoencoder(nn.Module):
         )
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
-        """Forward pass through autoencoder.
-
-        Args:
-            x: Input IQ signal [batch, 2, seq_len].
-
-        Returns:
-            Tuple of (reconstructed signal, latent representation).
-        """
+        """Forward pass through autoencoder."""
         z = self.encoder(x)
-        x_recon = self.decoder(z)
-        return x_recon, z
+        return self.decoder(z), z
 
     def encode(self, x: Tensor) -> Tensor:
-        """Encode input to latent space.
-
-        Args:
-            x: Input IQ signal [batch, 2, seq_len].
-
-        Returns:
-            Latent representation [batch, latent_dim].
-        """
+        """Encode input to latent space."""
         return self.encoder(x)
 
     def decode(self, z: Tensor) -> Tensor:
-        """Decode latent representation.
-
-        Args:
-            z: Latent tensor [batch, latent_dim].
-
-        Returns:
-            Reconstructed signal [batch, 2, seq_len].
-        """
+        """Decode latent representation."""
         return self.decoder(z)
 
-    def reconstruction_loss(
-        self,
-        x: Tensor,
-        x_recon: Tensor,
-        reduction: str = "mean",
-    ) -> Tensor:
-        """Compute reconstruction loss (MSE).
-
-        Args:
-            x: Original signal [batch, 2, seq_len].
-            x_recon: Reconstructed signal [batch, 2, seq_len].
-            reduction: Loss reduction method.
-
-        Returns:
-            Reconstruction loss.
-        """
+    def reconstruction_loss(self, x: Tensor, x_recon: Tensor, reduction: str = "mean") -> Tensor:
+        """Compute reconstruction loss (MSE)."""
         return nn.functional.mse_loss(x_recon, x, reduction=reduction)
 
     def get_reconstruction_error(self, x: Tensor) -> Tensor:
-        """Get per-sample reconstruction error.
-
-        Args:
-            x: Input IQ signal [batch, 2, seq_len].
-
-        Returns:
-            Reconstruction error per sample [batch].
-        """
+        """Get per-sample reconstruction error."""
         x_recon, _ = self(x)
-        # MSE per sample
-        error = ((x - x_recon) ** 2).mean(dim=(1, 2))
-        return error
+        return ((x - x_recon) ** 2).mean(dim=(1, 2))

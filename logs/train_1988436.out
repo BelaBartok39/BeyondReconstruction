@@ -1,0 +1,13 @@
+==========================================
+Job ID: 1988436
+Node: ig02
+Start Time: Sun Jan 18 12:12:15 CST 2026
+==========================================
+Using config: configs/default.yaml
+Python: /opt/ohpc/pub/apps/uofm/python/3.10.13/bin/python
+PyTorch version: 2.5.1+cu121
+CUDA available: True
+==========================================
+==========================================
+End Time: Sun Jan 18 12:15:06 CST 2026
+==========================================

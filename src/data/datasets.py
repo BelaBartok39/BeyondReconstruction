@@ -15,6 +15,20 @@ from .snr_estimation import estimate_snr, normalize_snr
 from .augmentation import RFAugmentor
 
 
+def normalize_power(power_db: float, power_range: tuple[float, float] = (-20, 10)) -> float:
+    """Normalize power to [0, 1] range.
+
+    Args:
+        power_db: Power in dB.
+        power_range: Min and max power in dB.
+
+    Returns:
+        Normalized power value in [0, 1].
+    """
+    min_power, max_power = power_range
+    return max(0.0, min(1.0, (power_db - min_power) / (max_power - min_power)))
+
+
 class RFDataset(Dataset):
     """PyTorch Dataset for RF IQ signals.
 
@@ -37,10 +51,12 @@ class RFDataset(Dataset):
         iq_data: NDArray[np.float32] | torch.Tensor,
         labels: NDArray[np.int64] | torch.Tensor | None = None,
         snr_values: NDArray[np.float32] | torch.Tensor | None = None,
+        power_values: NDArray[np.float32] | torch.Tensor | None = None,
         metadata: list[SignalMetadata] | None = None,
         augmentor: RFAugmentor | None = None,
         estimate_snr_online: bool = False,
         snr_range: tuple[float, float] = (-5, 30),
+        power_range: tuple[float, float] = (-20, 10),
     ):
         """Initialize dataset.
 
@@ -48,26 +64,22 @@ class RFDataset(Dataset):
             iq_data: IQ signal data [N, 2, seq_len].
             labels: Binary labels (0=normal, 1=anomaly) [N].
             snr_values: SNR values in dB [N].
+            power_values: Signal power values in dB [N].
             metadata: List of signal metadata.
             augmentor: Optional augmentation pipeline.
             estimate_snr_online: If True, estimate SNR from signal.
             snr_range: SNR range for normalization.
+            power_range: Power range for normalization (dB).
         """
         self.iq_data = torch.as_tensor(iq_data, dtype=torch.float32)
-        self.labels = (
-            torch.as_tensor(labels, dtype=torch.long)
-            if labels is not None
-            else torch.zeros(len(iq_data), dtype=torch.long)
-        )
-        self.snr_values = (
-            torch.as_tensor(snr_values, dtype=torch.float32)
-            if snr_values is not None
-            else None
-        )
+        self.labels = torch.as_tensor(labels, dtype=torch.long) if labels is not None else torch.zeros(len(iq_data), dtype=torch.long)
+        self.snr_values = torch.as_tensor(snr_values, dtype=torch.float32) if snr_values is not None else None
+        self.power_values = torch.as_tensor(power_values, dtype=torch.float32) if power_values is not None else None
         self.metadata = metadata
         self.augmentor = augmentor
         self.estimate_snr_online = estimate_snr_online
         self.snr_range = snr_range
+        self.power_range = power_range
 
     def __len__(self) -> int:
         """Return dataset size."""
@@ -85,10 +97,11 @@ class RFDataset(Dataset):
                 - label: Binary label (0 or 1)
                 - snr: Normalized SNR value [0, 1]
                 - snr_db: Raw SNR in dB
+                - power: Normalized power value [0, 1]
+                - power_db: Raw power in dB
         """
         iq = self.iq_data[idx].clone()
 
-        # Apply augmentation
         if self.augmentor is not None:
             iq = self.augmentor(iq)
 
@@ -98,15 +111,21 @@ class RFDataset(Dataset):
         elif self.estimate_snr_online:
             snr_db = estimate_snr(iq)
         else:
-            snr_db = 15.0  # Default middle value
+            snr_db = 15.0
 
-        snr_normalized = normalize_snr(snr_db, self.snr_range)
+        # Get power (default to 0 dB if not available)
+        if self.power_values is not None:
+            power_db = self.power_values[idx].item()
+        else:
+            power_db = -10.0  # Default: typical normal signal power
 
         return {
             "iq": iq,
             "label": self.labels[idx],
-            "snr": torch.tensor(snr_normalized, dtype=torch.float32),
+            "snr": torch.tensor(normalize_snr(snr_db, self.snr_range), dtype=torch.float32),
             "snr_db": torch.tensor(snr_db, dtype=torch.float32),
+            "power": torch.tensor(normalize_power(power_db, self.power_range), dtype=torch.float32),
+            "power_db": torch.tensor(power_db, dtype=torch.float32),
         }
 
     @classmethod
@@ -119,6 +138,7 @@ class RFDataset(Dataset):
         snr_range: tuple[float, float] = (-5, 30),
         anomaly_types: list[str] | None = None,
         augmentor: RFAugmentor | None = None,
+        power_range: tuple[float, float] = (-20, 10),
     ) -> "RFDataset":
         """Create dataset using synthetic generator.
 
@@ -130,6 +150,7 @@ class RFDataset(Dataset):
             snr_range: SNR range for generation.
             anomaly_types: List of anomaly types.
             augmentor: Optional augmentation pipeline.
+            power_range: Power range for normalization (dB).
 
         Returns:
             RFDataset instance.
@@ -144,14 +165,17 @@ class RFDataset(Dataset):
 
         labels = np.array([1 if m.is_anomaly else 0 for m in metadata], dtype=np.int64)
         snr_values = np.array([m.snr_db for m in metadata], dtype=np.float32)
+        power_values = np.array([m.signal_power_db or -10.0 for m in metadata], dtype=np.float32)
 
         return cls(
             iq_data=iq_data,
             labels=labels,
             snr_values=snr_values,
+            power_values=power_values,
             metadata=metadata,
             augmentor=augmentor,
             snr_range=snr_range,
+            power_range=power_range,
         )
 
     def save(self, path: str | Path) -> None:
@@ -167,7 +191,8 @@ class RFDataset(Dataset):
             path,
             iq_data=self.iq_data.numpy(),
             labels=self.labels.numpy(),
-            snr_values=self.snr_values.numpy() if self.snr_values is not None else None,
+            snr_values=self.snr_values.numpy() if self.snr_values is not None else np.array([]),
+            power_values=self.power_values.numpy() if self.power_values is not None else np.array([]),
         )
 
     @classmethod
@@ -181,12 +206,13 @@ class RFDataset(Dataset):
         Returns:
             RFDataset instance.
         """
-        data = np.load(path, allow_pickle=True)
+        data = np.load(path)
 
         return cls(
             iq_data=data["iq_data"],
             labels=data["labels"],
-            snr_values=data["snr_values"] if data["snr_values"].ndim > 0 else None,
+            snr_values=data["snr_values"] if data["snr_values"].size > 0 else None,
+            power_values=data["power_values"] if "power_values" in data and data["power_values"].size > 0 else None,
             **kwargs,
         )
 
@@ -214,6 +240,7 @@ class StreamingRFDataset(IterableDataset):
         augmentor: RFAugmentor | None = None,
         concept_drift: bool = False,
         drift_rate: float = 0.0,
+        power_range: tuple[float, float] = (-20, 10),
     ):
         """Initialize streaming dataset.
 
@@ -227,6 +254,7 @@ class StreamingRFDataset(IterableDataset):
             augmentor: Optional augmentation pipeline.
             concept_drift: Enable gradual distribution shift.
             drift_rate: Rate of concept drift per sample.
+            power_range: Power range for normalization (dB).
         """
         self.generator = generator
         self.samples_per_epoch = samples_per_epoch
@@ -237,6 +265,7 @@ class StreamingRFDataset(IterableDataset):
         self.augmentor = augmentor
         self.concept_drift = concept_drift
         self.drift_rate = drift_rate
+        self.power_range = power_range
         self._sample_count = 0
 
     def __iter__(self):
@@ -249,49 +278,43 @@ class StreamingRFDataset(IterableDataset):
         self._sample_count += 1
 
         # Apply concept drift by shifting SNR range
-        if self.concept_drift:
-            drift_offset = self._sample_count * self.drift_rate
-            snr_range = (
-                self.snr_range[0] + drift_offset,
-                self.snr_range[1] + drift_offset,
-            )
-        else:
-            snr_range = self.snr_range
+        drift_offset = self._sample_count * self.drift_rate if self.concept_drift else 0
+        snr_range = (self.snr_range[0] + drift_offset, self.snr_range[1] + drift_offset)
 
         # Generate normal or anomalous sample
-        if self.generator.rng.random() < self.anomaly_ratio:
+        is_anomaly = self.generator.rng.random() < self.anomaly_ratio
+        modulation = self._random_modulation()
+
+        if is_anomaly:
             iq, metadata = self.generator.generate_anomaly(
-                anomaly_type=None,  # Random
-                base_modulation=self._random_modulation(),
+                anomaly_type=None,
+                base_modulation=modulation,
                 snr_range=snr_range,
             )
-            label = 1
         else:
             iq, metadata = self.generator.generate_normal_signal(
-                modulation=self._random_modulation(),
+                modulation=modulation,
                 snr_range=snr_range,
             )
-            label = 0
 
         iq = torch.from_numpy(iq)
-
         if self.augmentor is not None:
             iq = self.augmentor(iq)
 
-        snr_normalized = normalize_snr(metadata.snr_db, self.snr_range)
+        power_db = metadata.signal_power_db or -10.0
 
         return {
             "iq": iq,
-            "label": torch.tensor(label, dtype=torch.long),
-            "snr": torch.tensor(snr_normalized, dtype=torch.float32),
+            "label": torch.tensor(int(is_anomaly), dtype=torch.long),
+            "snr": torch.tensor(normalize_snr(metadata.snr_db, self.snr_range), dtype=torch.float32),
             "snr_db": torch.tensor(metadata.snr_db, dtype=torch.float32),
+            "power": torch.tensor(normalize_power(power_db, self.power_range), dtype=torch.float32),
+            "power_db": torch.tensor(power_db, dtype=torch.float32),
         }
 
     def _random_modulation(self) -> str:
         """Get random modulation from available list."""
-        if self.modulations:
-            return self.generator.rng.choice(self.modulations)
-        return "qpsk"
+        return self.generator.rng.choice(self.modulations) if self.modulations else "qpsk"
 
 
 def create_dataloaders(
@@ -314,61 +337,41 @@ def create_dataloaders(
             seed=config.experiment.seed,
         )
 
-    snr_range = tuple(config.data.snr_range)
-    modulations = config.data.modulations
-    anomaly_types = config.data.anomaly_types
+    common_params = {
+        "generator": generator,
+        "modulations": config.data.modulations,
+        "snr_range": tuple(config.data.snr_range),
+        "anomaly_types": config.data.anomaly_types,
+    }
 
-    # Training data (normal only)
+    # Create datasets
     train_dataset = RFDataset.from_generator(
-        generator=generator,
         num_samples=config.data.num_train_samples,
         anomaly_ratio=0.0,  # Train on normal data only
-        modulations=modulations,
-        snr_range=snr_range,
+        **common_params,
     )
 
-    # Validation data (mostly normal, some anomalies for threshold tuning)
     val_dataset = RFDataset.from_generator(
-        generator=generator,
         num_samples=config.data.num_val_samples,
         anomaly_ratio=config.data.anomaly_ratio,
-        modulations=modulations,
-        snr_range=snr_range,
-        anomaly_types=anomaly_types,
+        **common_params,
     )
 
-    # Test data (with anomalies)
     test_dataset = RFDataset.from_generator(
-        generator=generator,
         num_samples=config.data.num_test_samples,
         anomaly_ratio=config.data.anomaly_ratio,
-        modulations=modulations,
-        snr_range=snr_range,
-        anomaly_types=anomaly_types,
+        **common_params,
     )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=True,
-        num_workers=config.experiment.num_workers,
-        pin_memory=True,
-    )
+    # Create dataloaders with common settings
+    loader_params = {
+        "batch_size": config.training.batch_size,
+        "num_workers": config.experiment.num_workers,
+        "pin_memory": True,
+    }
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=False,
-        num_workers=config.experiment.num_workers,
-        pin_memory=True,
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=False,
-        num_workers=config.experiment.num_workers,
-        pin_memory=True,
-    )
+    train_loader = DataLoader(train_dataset, shuffle=True, **loader_params)
+    val_loader = DataLoader(val_dataset, shuffle=False, **loader_params)
+    test_loader = DataLoader(test_dataset, shuffle=False, **loader_params)
 
     return train_loader, val_loader, test_loader

@@ -33,46 +33,120 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def get_model_capabilities(model: nn.Module) -> tuple[bool, bool, bool]:
+    """Detect model capabilities once.
+
+    Returns:
+        Tuple of (is_snr_conditioned, is_vae, uses_power_conditioning).
+    """
+    is_snr_conditioned = hasattr(model, "encoder") and hasattr(model.encoder, "cond_embed")
+    is_vae = hasattr(model, "reparameterize")
+    uses_power_conditioning = hasattr(model, "use_power_conditioning") and model.use_power_conditioning
+    return is_snr_conditioned, is_vae, uses_power_conditioning
+
+
+def model_forward(
+    model: nn.Module,
+    iq: torch.Tensor,
+    snr: torch.Tensor | None,
+    power: torch.Tensor | None,
+    is_snr_conditioned: bool,
+    is_vae: bool,
+    uses_power_conditioning: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+    """Unified forward pass handling all model types.
+
+    Returns:
+        Tuple of (x_recon, mu, logvar, latent).
+    """
+    if is_snr_conditioned and snr is not None:
+        if uses_power_conditioning and power is not None:
+            return model(iq, snr, power)
+        return model(iq, snr)
+    if is_vae:
+        return model(iq)
+    x_recon, latent = model(iq)
+    return x_recon, None, None, latent
+
+
+def compute_loss(
+    model: nn.Module,
+    iq: torch.Tensor,
+    x_recon: torch.Tensor,
+    mu: torch.Tensor | None,
+    logvar: torch.Tensor | None,
+    is_vae: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute loss for any model type.
+
+    Returns:
+        Tuple of (total_loss, recon_loss, kl_loss).
+    """
+    if is_vae and mu is not None and logvar is not None:
+        return model.loss(iq, x_recon, mu, logvar)
+    loss = model.reconstruction_loss(iq, x_recon)
+    return loss, loss, torch.tensor(0.0)
+
+
+def compute_contrastive_loss(
+    iq: torch.Tensor,
+    x_recon: torch.Tensor,
+    labels: torch.Tensor,
+    margin: float = 0.5,
+) -> torch.Tensor:
+    """Compute contrastive loss that encourages higher error for anomalies.
+
+    Args:
+        iq: Original signals [batch, 2, seq_len].
+        x_recon: Reconstructed signals.
+        labels: Binary labels (0=normal, 1=anomaly).
+        margin: Minimum difference between anomaly and normal error.
+
+    Returns:
+        Contrastive loss encouraging separation.
+    """
+    # Per-sample reconstruction error
+    recon_error = ((iq - x_recon) ** 2).mean(dim=(1, 2))
+
+    normal_mask = labels == 0
+    anomaly_mask = labels == 1
+
+    if normal_mask.sum() == 0 or anomaly_mask.sum() == 0:
+        return torch.tensor(0.0, device=iq.device)
+
+    # Normal samples: minimize reconstruction error
+    normal_loss = recon_error[normal_mask].mean()
+
+    # Anomaly samples: maximize reconstruction error (encourage error > margin)
+    # Use hinge loss: max(0, margin - anomaly_error)
+    anomaly_errors = recon_error[anomaly_mask]
+    anomaly_loss = torch.relu(margin - anomaly_errors).mean()
+
+    return normal_loss + anomaly_loss
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Train RF anomaly detection model")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/default.yaml",
-        help="Path to config file",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=None,
-        help="Output directory (default: checkpoints/<timestamp>)",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        help="Device to use (auto, cuda, cpu)",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed (overrides config)",
-    )
+    parser.add_argument("--config", default="configs/default.yaml", help="Path to config file")
+    parser.add_argument("--output-dir", default=None, help="Output directory (default: checkpoints/<timestamp>)")
+    parser.add_argument("--device", default="auto", help="Device to use (auto, cuda, cpu)")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed (overrides config)")
+    parser.add_argument("--semi-supervised", action="store_true", help="Use semi-supervised training with anomalies")
+    parser.add_argument("--train-anomaly-ratio", type=float, default=0.1, help="Anomaly ratio in training for semi-supervised")
+    parser.add_argument("--contrastive-weight", type=float, default=1.0, help="Weight for contrastive loss in semi-supervised")
     return parser.parse_args()
 
 
 def get_device(device_str: str) -> torch.device:
     """Get torch device from string."""
-    if device_str == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return torch.device("mps")
-        else:
-            return torch.device("cpu")
-    return torch.device(device_str)
+    if device_str != "auto":
+        return torch.device(device_str)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def train_epoch(
@@ -81,6 +155,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     gradient_clip_norm: float | None = 1.0,
+    contrastive_weight: float = 0.0,
 ) -> dict[str, float]:
     """Train for one epoch.
 
@@ -90,129 +165,87 @@ def train_epoch(
         optimizer: Optimizer.
         device: Training device.
         gradient_clip_norm: Gradient clipping threshold.
-
-    Returns:
-        Dictionary with training metrics.
+        contrastive_weight: Weight for contrastive loss (0 = disabled).
     """
     model.train()
+    is_snr_conditioned, is_vae, uses_power = get_model_capabilities(model)
 
-    total_loss = 0.0
-    total_recon_loss = 0.0
-    total_kl_loss = 0.0
+    total_loss = total_recon = total_kl = total_contrastive = 0.0
     num_batches = 0
 
-    is_snr_conditioned = hasattr(model, "encoder") and hasattr(model.encoder, "snr_embed")
-    is_vae = hasattr(model, "reparameterize")
-
-    pbar = tqdm(train_loader, desc="Training", leave=False)
-    for batch in pbar:
+    for batch in tqdm(train_loader, desc="Training", leave=False):
         iq = batch["iq"].to(device)
         snr = batch.get("snr")
+        power = batch.get("power")
+        labels = batch.get("label")
         if snr is not None:
             snr = snr.to(device)
+        if power is not None:
+            power = power.to(device)
+        if labels is not None:
+            labels = labels.to(device)
 
         optimizer.zero_grad()
 
-        # Forward pass
-        if is_snr_conditioned and snr is not None:
-            x_recon, mu, logvar, _ = model(iq, snr)
-            loss, recon_loss, kl_loss = model.loss(iq, x_recon, mu, logvar)
-        elif is_vae:
-            x_recon, mu, logvar, _ = model(iq)
-            loss, recon_loss, kl_loss = model.loss(iq, x_recon, mu, logvar)
-        else:
-            x_recon, _ = model(iq)
-            loss = model.reconstruction_loss(iq, x_recon)
-            recon_loss = loss
-            kl_loss = torch.tensor(0.0)
+        # Forward and compute loss
+        x_recon, mu, logvar, _ = model_forward(model, iq, snr, power, is_snr_conditioned, is_vae, uses_power)
+        loss, recon_loss, kl_loss = compute_loss(model, iq, x_recon, mu, logvar, is_vae)
 
-        # Backward pass
+        # Add contrastive loss if semi-supervised
+        contrastive_loss = torch.tensor(0.0, device=device)
+        if contrastive_weight > 0 and labels is not None:
+            contrastive_loss = compute_contrastive_loss(iq, x_recon, labels)
+            loss = loss + contrastive_weight * contrastive_loss
+
         loss.backward()
-
         if gradient_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
-
         optimizer.step()
 
-        # Accumulate metrics
         total_loss += loss.item()
-        total_recon_loss += recon_loss.item()
-        total_kl_loss += kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
+        total_recon += recon_loss.item()
+        total_kl += kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
+        total_contrastive += contrastive_loss.item() if isinstance(contrastive_loss, torch.Tensor) else contrastive_loss
         num_batches += 1
-
-        pbar.set_postfix({"loss": loss.item()})
 
     return {
         "loss": total_loss / num_batches,
-        "recon_loss": total_recon_loss / num_batches,
-        "kl_loss": total_kl_loss / num_batches,
+        "recon_loss": total_recon / num_batches,
+        "kl_loss": total_kl / num_batches,
+        "contrastive_loss": total_contrastive / num_batches,
     }
 
 
 @torch.no_grad()
-def validate(
-    model: nn.Module,
-    val_loader: DataLoader,
-    device: torch.device,
-) -> dict[str, float]:
-    """Validate model.
-
-    Args:
-        model: Model to validate.
-        val_loader: Validation data loader.
-        device: Device.
-
-    Returns:
-        Dictionary with validation metrics.
-    """
+def validate(model: nn.Module, val_loader: DataLoader, device: torch.device) -> dict[str, float]:
+    """Validate model."""
     model.eval()
+    is_snr_conditioned, is_vae, uses_power = get_model_capabilities(model)
 
     total_loss = 0.0
-    num_batches = 0
-
-    is_snr_conditioned = hasattr(model, "encoder") and hasattr(model.encoder, "snr_embed")
-    is_vae = hasattr(model, "reparameterize")
 
     for batch in val_loader:
         iq = batch["iq"].to(device)
         snr = batch.get("snr")
+        power = batch.get("power")
         if snr is not None:
             snr = snr.to(device)
+        if power is not None:
+            power = power.to(device)
 
-        if is_snr_conditioned and snr is not None:
-            x_recon, mu, logvar, _ = model(iq, snr)
-            loss, _, _ = model.loss(iq, x_recon, mu, logvar)
-        elif is_vae:
-            x_recon, mu, logvar, _ = model(iq)
-            loss, _, _ = model.loss(iq, x_recon, mu, logvar)
-        else:
-            x_recon, _ = model(iq)
-            loss = model.reconstruction_loss(iq, x_recon)
-
+        x_recon, mu, logvar, _ = model_forward(model, iq, snr, power, is_snr_conditioned, is_vae, uses_power)
+        loss, _, _ = compute_loss(model, iq, x_recon, mu, logvar, is_vae)
         total_loss += loss.item()
-        num_batches += 1
 
-    return {"val_loss": total_loss / num_batches}
+    return {"val_loss": total_loss / len(val_loader)}
 
 
-def evaluate_detection(
-    model: nn.Module,
-    test_loader: DataLoader,
-    device: torch.device,
-    config,
-) -> dict[str, float]:
-    """Evaluate anomaly detection performance.
+def evaluate_detection(model: nn.Module, test_loader: DataLoader, device: torch.device, config) -> dict[str, float]:
+    """Evaluate anomaly detection performance."""
+    # Get config values with defaults for backwards compatibility
+    invert_scores = config.detection.get("invert_scores", False)
+    hybrid_weights = tuple(config.detection.get("hybrid_weights", [0.5, 0.5]))
 
-    Args:
-        model: Trained model.
-        test_loader: Test data loader with anomalies.
-        device: Device.
-        config: Configuration.
-
-    Returns:
-        Dictionary with detection metrics.
-    """
-    # Create and fit detector
     detector = AnomalyDetector(
         model=model,
         method=config.detection.method,
@@ -220,21 +253,17 @@ def evaluate_detection(
         threshold_percentile=config.detection.threshold_percentile,
         snr_adaptive=config.detection.snr_adaptive,
         snr_bins=config.detection.snr_bins,
+        invert_scores=invert_scores,
+        hybrid_weights=hybrid_weights,
         device=device,
     )
-
-    # Fit on normal data from test set
     detector.fit(test_loader, num_batches=50)
-
-    # Detect anomalies
     scores, predictions, labels = detector.detect_batch(test_loader)
 
     if labels is None:
         return {"error": "No labels in test data"}
 
-    # Compute metrics
     metrics = compute_metrics(scores, labels, predictions)
-
     return {
         "auroc": metrics.auroc,
         "auprc": metrics.auprc,
@@ -259,17 +288,13 @@ def main():
     # Set random seeds
     torch.manual_seed(config.experiment.seed)
 
-    # Setup device
+    # Setup device and output directory
     device = get_device(args.device if args.device != "auto" else config.experiment.device)
     logger.info(f"Using device: {device}")
 
-    # Setup output directory
-    if args.output_dir:
-        output_dir = Path(args.output_dir)
-    else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = Path(config.experiment.save_dir) / timestamp
-
+    output_dir = Path(args.output_dir) if args.output_dir else (
+        Path(config.experiment.save_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Output directory: {output_dir}")
 
@@ -286,7 +311,34 @@ def main():
 
     # Create data loaders
     logger.info("Creating data loaders...")
-    train_loader, val_loader, test_loader = create_dataloaders(config, generator)
+    if args.semi_supervised:
+        # For semi-supervised, include some anomalies in training data
+        logger.info(f"Semi-supervised mode: {args.train_anomaly_ratio:.0%} anomalies in training")
+        train_dataset = RFDataset.from_generator(
+            generator=generator,
+            num_samples=config.data.num_train_samples,
+            anomaly_ratio=args.train_anomaly_ratio,
+            snr_range=tuple(config.data.snr_range),
+            modulations=config.data.modulations,
+            anomaly_types=config.data.anomaly_types,
+        )
+        val_dataset = RFDataset.from_generator(
+            generator=generator,
+            num_samples=config.data.num_val_samples,
+            anomaly_ratio=config.data.anomaly_ratio,
+            snr_range=tuple(config.data.snr_range),
+        )
+        test_dataset = RFDataset.from_generator(
+            generator=generator,
+            num_samples=config.data.num_test_samples,
+            anomaly_ratio=config.data.anomaly_ratio,
+            snr_range=tuple(config.data.snr_range),
+        )
+        train_loader = DataLoader(train_dataset, batch_size=config.training.batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=config.training.batch_size)
+        test_loader = DataLoader(test_dataset, batch_size=config.training.batch_size)
+    else:
+        train_loader, val_loader, test_loader = create_dataloaders(config, generator)
     logger.info(f"Training samples: {len(train_loader.dataset)}")
     logger.info(f"Validation samples: {len(val_loader.dataset)}")
     logger.info(f"Test samples: {len(test_loader.dataset)}")
@@ -308,18 +360,13 @@ def main():
     )
 
     # Create scheduler
+    scheduler = None
     if config.training.scheduler.type == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=config.training.scheduler.T_max,
-            eta_min=config.training.scheduler.min_lr,
+            optimizer, T_max=config.training.scheduler.T_max, eta_min=config.training.scheduler.min_lr
         )
     elif config.training.scheduler.type == "step":
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=30, gamma=0.1
-        )
-    else:
-        scheduler = None
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
 
     # Training loop
     logger.info("Starting training...")
@@ -327,39 +374,31 @@ def main():
     patience_counter = 0
     history = {"train": [], "val": []}
 
+    contrastive_weight = args.contrastive_weight if args.semi_supervised else 0.0
+
     for epoch in range(1, config.training.num_epochs + 1):
-        # Train
         train_metrics = train_epoch(
             model, train_loader, optimizer, device,
-            gradient_clip_norm=config.training.gradient_clip_norm,
+            config.training.gradient_clip_norm, contrastive_weight
         )
-
-        # Validate
         val_metrics = validate(model, val_loader, device)
 
-        # Update scheduler
         if scheduler is not None:
             scheduler.step()
 
-        # Log progress
-        lr = optimizer.param_groups[0]["lr"]
         logger.info(
             f"Epoch {epoch}/{config.training.num_epochs} - "
             f"Train Loss: {train_metrics['loss']:.4f} - "
             f"Val Loss: {val_metrics['val_loss']:.4f} - "
-            f"LR: {lr:.2e}"
+            f"LR: {optimizer.param_groups[0]['lr']:.2e}"
         )
 
-        # Save history
         history["train"].append(train_metrics)
         history["val"].append(val_metrics)
 
-        # Check for improvement
         if val_metrics["val_loss"] < best_val_loss:
             best_val_loss = val_metrics["val_loss"]
             patience_counter = 0
-
-            # Save best model
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
@@ -369,12 +408,10 @@ def main():
         else:
             patience_counter += 1
 
-        # Early stopping
         if patience_counter >= config.training.early_stopping_patience:
             logger.info(f"Early stopping at epoch {epoch}")
             break
 
-        # Periodic checkpoint
         if epoch % config.experiment.checkpoint_interval == 0:
             torch.save({
                 "epoch": epoch,

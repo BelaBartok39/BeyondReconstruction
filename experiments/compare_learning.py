@@ -37,33 +37,59 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def get_model_capabilities(model: nn.Module) -> tuple[bool, bool]:
+    """Detect model capabilities once."""
+    is_snr_conditioned = hasattr(model, "encoder") and hasattr(model.encoder, "snr_embed")
+    is_vae = hasattr(model, "reparameterize")
+    return is_snr_conditioned, is_vae
+
+
+def model_forward(
+    model: nn.Module,
+    iq: torch.Tensor,
+    snr: torch.Tensor | None,
+    is_snr_conditioned: bool,
+    is_vae: bool,
+) -> torch.Tensor:
+    """Unified forward pass returning reconstruction only."""
+    if is_snr_conditioned and snr is not None:
+        x_recon, _, _, _ = model(iq, snr)
+    elif is_vae:
+        x_recon, _, _, _ = model(iq)
+    else:
+        x_recon, _ = model(iq)
+    return x_recon
+
+
+def compute_task_loss(
+    model: nn.Module,
+    iq: torch.Tensor,
+    snr: torch.Tensor | None,
+    is_snr_conditioned: bool,
+    is_vae: bool,
+) -> torch.Tensor:
+    """Compute task loss for any model type."""
+    if is_snr_conditioned and snr is not None:
+        x_recon, mu, logvar, _ = model(iq, snr)
+        loss, _, _ = model.loss(iq, x_recon, mu, logvar)
+    elif is_vae:
+        x_recon, mu, logvar, _ = model(iq)
+        loss, _, _ = model.loss(iq, x_recon, mu, logvar)
+    else:
+        x_recon, _ = model(iq)
+        loss = model.reconstruction_loss(iq, x_recon)
+    return loss
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Compare continuous learning methods")
-    parser.add_argument(
-        "--config", type=str, default="configs/default.yaml",
-        help="Path to config file",
-    )
-    parser.add_argument(
-        "--baseline-checkpoint", type=str, required=True,
-        help="Path to trained baseline model checkpoint",
-    )
-    parser.add_argument(
-        "--output-dir", type=str, default=None,
-        help="Output directory",
-    )
-    parser.add_argument(
-        "--num-streaming-samples", type=int, default=10000,
-        help="Number of streaming samples for continuous learning",
-    )
-    parser.add_argument(
-        "--eval-interval", type=int, default=500,
-        help="Evaluation interval in samples",
-    )
-    parser.add_argument(
-        "--concept-drift", action="store_true",
-        help="Enable concept drift in streaming data",
-    )
+    parser.add_argument("--config", default="configs/default.yaml", help="Path to config file")
+    parser.add_argument("--baseline-checkpoint", required=True, help="Path to trained baseline model checkpoint")
+    parser.add_argument("--output-dir", default=None, help="Output directory")
+    parser.add_argument("--num-streaming-samples", type=int, default=10000, help="Number of streaming samples")
+    parser.add_argument("--eval-interval", type=int, default=500, help="Evaluation interval in samples")
+    parser.add_argument("--concept-drift", action="store_true", help="Enable concept drift in streaming data")
     return parser.parse_args()
 
 
@@ -83,19 +109,12 @@ def load_baseline_model(checkpoint_path: str, config, device: torch.device) -> n
     return model
 
 
-def evaluate_model(
-    model: nn.Module,
-    test_loader: DataLoader,
-    device: torch.device,
-) -> dict[str, float]:
+def evaluate_model(model: nn.Module, test_loader: DataLoader, device: torch.device) -> dict[str, float]:
     """Evaluate model on test set."""
     model.eval()
+    is_snr_conditioned, is_vae = get_model_capabilities(model)
 
-    all_scores = []
-    all_labels = []
-
-    is_snr_conditioned = hasattr(model, "encoder") and hasattr(model.encoder, "snr_embed")
-    is_vae = hasattr(model, "reparameterize")
+    all_scores, all_labels = [], []
 
     with torch.no_grad():
         for batch in test_loader:
@@ -103,23 +122,15 @@ def evaluate_model(
             snr = batch.get("snr")
             if snr is not None:
                 snr = snr.to(device)
-            labels = batch["label"]
 
-            # Get reconstruction error
-            if is_snr_conditioned and snr is not None:
-                x_recon, _, _, _ = model(iq, snr)
-            elif is_vae:
-                x_recon, _, _, _ = model(iq)
-            else:
-                x_recon, _ = model(iq)
-
+            x_recon = model_forward(model, iq, snr, is_snr_conditioned, is_vae)
             error = ((iq - x_recon) ** 2).mean(dim=(1, 2))
+
             all_scores.append(error.cpu())
-            all_labels.append(labels)
+            all_labels.append(batch["label"])
 
     scores = torch.cat(all_scores).numpy()
     labels = torch.cat(all_labels).numpy()
-
     metrics = compute_metrics(scores, labels)
 
     return {
@@ -181,7 +192,6 @@ def run_online_ewc_learning(
     """Run online learning with EWC."""
     logger.info("Running Online Learning with EWC...")
 
-    # Compute Fisher information on initial data
     ewc = EWCLearner(
         model=model,
         ewc_lambda=config.continuous_learning.ewc.lambda_,
@@ -190,17 +200,11 @@ def run_online_ewc_learning(
     )
     ewc.compute_fisher(initial_data_loader)
 
-    # Setup optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.continuous_learning.online.learning_rate,
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.continuous_learning.online.learning_rate)
+    is_snr_conditioned, is_vae = get_model_capabilities(model)
 
     metrics_history = []
     sample_count = 0
-
-    is_snr_conditioned = hasattr(model, "encoder") and hasattr(model.encoder, "snr_embed")
-    is_vae = hasattr(model, "reparameterize")
 
     for batch in tqdm(stream_loader, desc="Online+EWC Learning"):
         model.train()
@@ -211,26 +215,13 @@ def run_online_ewc_learning(
             snr = snr.to(device)
 
         optimizer.zero_grad()
-
-        # Compute task loss
-        if is_snr_conditioned and snr is not None:
-            x_recon, mu, logvar, _ = model(iq, snr)
-            task_loss, _, _ = model.loss(iq, x_recon, mu, logvar)
-        elif is_vae:
-            x_recon, mu, logvar, _ = model(iq)
-            task_loss, _, _ = model.loss(iq, x_recon, mu, logvar)
-        else:
-            x_recon, _ = model(iq)
-            task_loss = model.reconstruction_loss(iq, x_recon)
-
-        # Add EWC penalty
+        task_loss = compute_task_loss(model, iq, snr, is_snr_conditioned, is_vae)
         loss = task_loss + ewc.penalty()
         loss.backward()
         optimizer.step()
 
         sample_count += batch["iq"].size(0)
 
-        # Periodic evaluation
         if sample_count % eval_interval == 0:
             eval_metrics = evaluate_model(model, test_loader, device)
             eval_metrics["sample_count"] = sample_count
@@ -272,12 +263,8 @@ def run_periodic_retraining(
         sample_count += batch["iq"].size(0)
 
         if retrainer.should_retrain():
-            def validation_fn(m):
-                return evaluate_model(m, test_loader, device)
+            retrainer.retrain(validation_fn=lambda m: evaluate_model(m, test_loader, device))
 
-            retrainer.retrain(validation_fn=validation_fn)
-
-        # Periodic evaluation
         if sample_count % eval_interval == 0:
             eval_metrics = evaluate_model(model, test_loader, device)
             eval_metrics["sample_count"] = sample_count
@@ -324,18 +311,14 @@ def main():
     """Main comparison function."""
     args = parse_args()
 
-    # Load configuration
+    # Load configuration and setup
     config = load_config(args.config)
     device = get_device()
     logger.info(f"Using device: {device}")
 
-    # Setup output directory
-    if args.output_dir:
-        output_dir = Path(args.output_dir)
-    else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = Path("results") / f"comparison_{timestamp}"
-
+    output_dir = Path(args.output_dir) if args.output_dir else (
+        Path("results") / f"comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Output directory: {output_dir}")
 
@@ -415,15 +398,15 @@ def main():
         logger.info(f"  F1: {final.get('f1', 0):.4f}")
 
     # Save results
+    serializable_results = {
+        method: {
+            "method": result["method"],
+            "final_metrics": result["final_metrics"],
+            "history": result["history"],
+        }
+        for method, result in results.items()
+    }
     with open(output_dir / "comparison_results.json", "w") as f:
-        # Convert to serializable format
-        serializable_results = {}
-        for method, result in results.items():
-            serializable_results[method] = {
-                "method": result["method"],
-                "final_metrics": result["final_metrics"],
-                "history": result["history"],
-            }
         json.dump(serializable_results, f, indent=2)
 
     logger.info(f"\nResults saved to {output_dir}")

@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=rf_evaluate
-#SBATCH --partition=gpu
+#SBATCH --partition=igpuq
 #SBATCH --gres=gpu:1
 #SBATCH --time=02:00:00
 #SBATCH --mem=16G
@@ -30,11 +30,14 @@ CHECKPOINT=$1
 
 # Load modules
 module purge
-module load cuda/12.1
-module load anaconda3
+module load nvhpc/23.11
+module load python/3.10.13/gcc.8.5.0
+module load cuda/12.3
+module load cudnn/8.9.7.29
 
 # Activate environment
-source ~/rf_anomaly_env/bin/activate
+conda deactivate 2>/dev/null || true
+source /project/ndrdmond/pythonGPU/bin/activate
 
 cd ~/CLP_Project
 mkdir -p logs

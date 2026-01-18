@@ -15,6 +15,17 @@ from torch import Tensor
 plt.style.use("seaborn-v0_8-whitegrid")
 
 
+def _to_numpy(x: NDArray | Tensor) -> NDArray:
+    """Convert tensor to numpy array."""
+    return x.detach().cpu().numpy() if isinstance(x, Tensor) else x
+
+
+def _save_fig(fig: plt.Figure, save_path: str | Path | None) -> None:
+    """Save figure if path is provided."""
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+
+
 def plot_signals(
     signals: NDArray | Tensor,
     titles: Sequence[str] | None = None,
@@ -34,39 +45,28 @@ def plot_signals(
     Returns:
         Matplotlib figure.
     """
-    if isinstance(signals, Tensor):
-        signals = signals.detach().cpu().numpy()
-
+    signals = _to_numpy(signals)
     if signals.ndim == 2:
         signals = signals[np.newaxis, ...]
 
     n_signals = min(len(signals), max_signals)
-
     fig, axes = plt.subplots(n_signals, 2, figsize=figsize)
-    if n_signals == 1:
-        axes = axes[np.newaxis, :]
+    axes = axes[np.newaxis, :] if n_signals == 1 else axes
 
     for i in range(n_signals):
-        sig = signals[i]
-
-        # I channel
-        axes[i, 0].plot(sig[0], linewidth=0.5, color="blue")
+        title_suffix = f" - {titles[i]}" if titles else ""
+        axes[i, 0].plot(signals[i, 0], linewidth=0.5, color="blue")
         axes[i, 0].set_ylabel("Amplitude")
-        axes[i, 0].set_title(f"I Channel" + (f" - {titles[i]}" if titles else ""))
+        axes[i, 0].set_title(f"I Channel{title_suffix}")
 
-        # Q channel
-        axes[i, 1].plot(sig[1], linewidth=0.5, color="orange")
+        axes[i, 1].plot(signals[i, 1], linewidth=0.5, color="orange")
         axes[i, 1].set_ylabel("Amplitude")
-        axes[i, 1].set_title(f"Q Channel" + (f" - {titles[i]}" if titles else ""))
+        axes[i, 1].set_title(f"Q Channel{title_suffix}")
 
     axes[-1, 0].set_xlabel("Sample")
     axes[-1, 1].set_xlabel("Sample")
-
     plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-
+    _save_fig(fig, save_path)
     return fig
 
 
@@ -87,42 +87,23 @@ def plot_reconstruction(
     Returns:
         Matplotlib figure.
     """
-    if isinstance(original, Tensor):
-        original = original.detach().cpu().numpy()
-    if isinstance(reconstructed, Tensor):
-        reconstructed = reconstructed.detach().cpu().numpy()
+    original = _to_numpy(original)
+    reconstructed = _to_numpy(reconstructed)
 
     fig, axes = plt.subplots(2, 2, figsize=figsize)
 
-    # I channel
-    axes[0, 0].plot(original[0], label="Original", alpha=0.7)
-    axes[0, 0].plot(reconstructed[0], label="Reconstructed", alpha=0.7)
-    axes[0, 0].set_title("I Channel")
-    axes[0, 0].legend()
+    for idx, (channel, color) in enumerate([("I", "blue"), ("Q", "orange")]):
+        axes[0, idx].plot(original[idx], label="Original", alpha=0.7)
+        axes[0, idx].plot(reconstructed[idx], label="Reconstructed", alpha=0.7)
+        axes[0, idx].set_title(f"{channel} Channel")
+        axes[0, idx].legend()
 
-    # Q channel
-    axes[0, 1].plot(original[1], label="Original", alpha=0.7)
-    axes[0, 1].plot(reconstructed[1], label="Reconstructed", alpha=0.7)
-    axes[0, 1].set_title("Q Channel")
-    axes[0, 1].legend()
-
-    # Reconstruction error
-    error_i = original[0] - reconstructed[0]
-    error_q = original[1] - reconstructed[1]
-
-    axes[1, 0].plot(error_i, color="red", alpha=0.7)
-    axes[1, 0].set_title("I Channel Error")
-    axes[1, 0].set_xlabel("Sample")
-
-    axes[1, 1].plot(error_q, color="red", alpha=0.7)
-    axes[1, 1].set_title("Q Channel Error")
-    axes[1, 1].set_xlabel("Sample")
+        axes[1, idx].plot(original[idx] - reconstructed[idx], color="red", alpha=0.7)
+        axes[1, idx].set_title(f"{channel} Channel Error")
+        axes[1, idx].set_xlabel("Sample")
 
     plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-
+    _save_fig(fig, save_path)
     return fig
 
 
@@ -143,9 +124,7 @@ def plot_constellation(
     Returns:
         Matplotlib figure.
     """
-    if isinstance(signal, Tensor):
-        signal = signal.detach().cpu().numpy()
-
+    signal = _to_numpy(signal)
     fig, ax = plt.subplots(figsize=figsize)
 
     ax.scatter(signal[0], signal[1], alpha=0.5, s=1)
@@ -155,9 +134,7 @@ def plot_constellation(
     ax.set_aspect("equal")
     ax.grid(True)
 
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-
+    _save_fig(fig, save_path)
     return fig
 
 
@@ -180,21 +157,17 @@ def plot_latent_space(
     Returns:
         Matplotlib figure.
     """
-    if isinstance(latents, Tensor):
-        latents = latents.detach().cpu().numpy()
-    if isinstance(labels, Tensor):
-        labels = labels.detach().cpu().numpy()
+    latents = _to_numpy(latents)
+    labels = _to_numpy(labels) if labels is not None else None
 
     # Dimensionality reduction
     if latents.shape[1] > 2:
         if method == "pca":
             from sklearn.decomposition import PCA
-            reducer = PCA(n_components=2)
-            latents_2d = reducer.fit_transform(latents)
+            latents_2d = PCA(n_components=2).fit_transform(latents)
         elif method == "tsne":
             from sklearn.manifold import TSNE
-            reducer = TSNE(n_components=2, random_state=42)
-            latents_2d = reducer.fit_transform(latents)
+            latents_2d = TSNE(n_components=2, random_state=42).fit_transform(latents)
         else:
             raise ValueError(f"Unknown method: {method}")
     else:
@@ -203,25 +176,8 @@ def plot_latent_space(
     fig, ax = plt.subplots(figsize=figsize)
 
     if labels is not None:
-        normal_mask = labels == 0
-        anomaly_mask = labels == 1
-
-        ax.scatter(
-            latents_2d[normal_mask, 0],
-            latents_2d[normal_mask, 1],
-            c="blue",
-            label="Normal",
-            alpha=0.5,
-            s=10,
-        )
-        ax.scatter(
-            latents_2d[anomaly_mask, 0],
-            latents_2d[anomaly_mask, 1],
-            c="red",
-            label="Anomaly",
-            alpha=0.5,
-            s=10,
-        )
+        for mask, color, label in [(labels == 0, "blue", "Normal"), (labels == 1, "red", "Anomaly")]:
+            ax.scatter(latents_2d[mask, 0], latents_2d[mask, 1], c=color, label=label, alpha=0.5, s=10)
         ax.legend()
     else:
         ax.scatter(latents_2d[:, 0], latents_2d[:, 1], alpha=0.5, s=10)
@@ -230,9 +186,7 @@ def plot_latent_space(
     ax.set_ylabel(f"{method.upper()} Component 2")
     ax.set_title("Latent Space Visualization")
 
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-
+    _save_fig(fig, save_path)
     return fig
 
 
@@ -254,11 +208,10 @@ def plot_learning_curves(
         Matplotlib figure.
     """
     fig, ax = plt.subplots(figsize=figsize)
-
     epochs = range(1, len(train_losses) + 1)
 
     ax.plot(epochs, train_losses, label="Training Loss", marker="o", markersize=3)
-    if val_losses is not None:
+    if val_losses:
         ax.plot(epochs, val_losses, label="Validation Loss", marker="s", markersize=3)
 
     ax.set_xlabel("Epoch")
@@ -267,9 +220,7 @@ def plot_learning_curves(
     ax.legend()
     ax.grid(True)
 
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-
+    _save_fig(fig, save_path)
     return fig
 
 
@@ -296,9 +247,7 @@ def plot_detection_curves(
 
     # ROC curve
     fpr, tpr, _ = roc_curve(labels, scores)
-    roc_auc = auc(fpr, tpr)
-
-    axes[0].plot(fpr, tpr, label=f"ROC (AUC = {roc_auc:.3f})")
+    axes[0].plot(fpr, tpr, label=f"ROC (AUC = {auc(fpr, tpr):.3f})")
     axes[0].plot([0, 1], [0, 1], "k--", label="Random")
     axes[0].set_xlabel("False Positive Rate")
     axes[0].set_ylabel("True Positive Rate")
@@ -308,9 +257,7 @@ def plot_detection_curves(
 
     # Precision-Recall curve
     precision, recall, _ = precision_recall_curve(labels, scores)
-    pr_auc = auc(recall, precision)
-
-    axes[1].plot(recall, precision, label=f"PR (AUC = {pr_auc:.3f})")
+    axes[1].plot(recall, precision, label=f"PR (AUC = {auc(recall, precision):.3f})")
     axes[1].set_xlabel("Recall")
     axes[1].set_ylabel("Precision")
     axes[1].set_title("Precision-Recall Curve")
@@ -318,10 +265,7 @@ def plot_detection_curves(
     axes[1].grid(True)
 
     plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-
+    _save_fig(fig, save_path)
     return fig
 
 
@@ -345,33 +289,23 @@ def plot_snr_performance(
         Matplotlib figure.
     """
     fig, axes = plt.subplots(1, 2, figsize=figsize)
-
-    bin_centers = [(b[0] + b[1]) / 2 for b in snr_bins]
     bin_labels = [f"{b[0]:.0f}-{b[1]:.0f}" for b in snr_bins]
+    x_pos = range(len(aurocs))
 
-    # AUROC
-    axes[0].bar(range(len(aurocs)), aurocs, color="steelblue")
-    axes[0].set_xticks(range(len(aurocs)))
-    axes[0].set_xticklabels(bin_labels, rotation=45)
-    axes[0].set_xlabel("SNR Range (dB)")
-    axes[0].set_ylabel("AUROC")
-    axes[0].set_title("AUROC vs SNR")
-    axes[0].set_ylim(0, 1)
-
-    # F1 Score
-    axes[1].bar(range(len(f1_scores)), f1_scores, color="darkorange")
-    axes[1].set_xticks(range(len(f1_scores)))
-    axes[1].set_xticklabels(bin_labels, rotation=45)
-    axes[1].set_xlabel("SNR Range (dB)")
-    axes[1].set_ylabel("F1 Score")
-    axes[1].set_title("F1 Score vs SNR")
-    axes[1].set_ylim(0, 1)
+    for ax, data, ylabel, title, color in [
+        (axes[0], aurocs, "AUROC", "AUROC vs SNR", "steelblue"),
+        (axes[1], f1_scores, "F1 Score", "F1 Score vs SNR", "darkorange")
+    ]:
+        ax.bar(x_pos, data, color=color)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(bin_labels, rotation=45)
+        ax.set_xlabel("SNR Range (dB)")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.set_ylim(0, 1)
 
     plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-
+    _save_fig(fig, save_path)
     return fig
 
 
@@ -396,11 +330,8 @@ def plot_score_distribution(
     """
     fig, ax = plt.subplots(figsize=figsize)
 
-    normal_scores = scores[labels == 0]
-    anomaly_scores = scores[labels == 1]
-
-    ax.hist(normal_scores, bins=50, alpha=0.6, label="Normal", density=True)
-    ax.hist(anomaly_scores, bins=50, alpha=0.6, label="Anomaly", density=True)
+    ax.hist(scores[labels == 0], bins=50, alpha=0.6, label="Normal", density=True)
+    ax.hist(scores[labels == 1], bins=50, alpha=0.6, label="Anomaly", density=True)
 
     if threshold is not None:
         ax.axvline(threshold, color="red", linestyle="--", label=f"Threshold ({threshold:.4f})")
@@ -410,9 +341,7 @@ def plot_score_distribution(
     ax.set_title("Score Distribution")
     ax.legend()
 
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-
+    _save_fig(fig, save_path)
     return fig
 
 
@@ -432,35 +361,23 @@ def plot_continuous_learning_metrics(
         Matplotlib figure.
     """
     fig, axes = plt.subplots(2, 2, figsize=figsize)
-
-    # Extract metrics
     steps = range(len(metrics_history))
-    losses = [m.get("loss", 0) for m in metrics_history]
-    aurocs = [m.get("auroc", 0) for m in metrics_history]
-    f1s = [m.get("f1", 0) for m in metrics_history]
 
-    # Loss
-    axes[0, 0].plot(steps, losses)
-    axes[0, 0].set_xlabel("Update Step")
-    axes[0, 0].set_ylabel("Loss")
-    axes[0, 0].set_title("Training Loss")
-
-    # AUROC
-    axes[0, 1].plot(steps, aurocs)
-    axes[0, 1].set_xlabel("Update Step")
-    axes[0, 1].set_ylabel("AUROC")
-    axes[0, 1].set_title("Detection AUROC")
-    axes[0, 1].set_ylim(0, 1)
-
-    # F1 Score
-    axes[1, 0].plot(steps, f1s)
-    axes[1, 0].set_xlabel("Update Step")
-    axes[1, 0].set_ylabel("F1 Score")
-    axes[1, 0].set_title("Detection F1")
-    axes[1, 0].set_ylim(0, 1)
+    # Plot loss, AUROC, and F1
+    for ax, key, ylabel, title, ylim in [
+        (axes[0, 0], "loss", "Loss", "Training Loss", None),
+        (axes[0, 1], "auroc", "AUROC", "Detection AUROC", (0, 1)),
+        (axes[1, 0], "f1", "F1 Score", "Detection F1", (0, 1))
+    ]:
+        ax.plot(steps, [m.get(key, 0) for m in metrics_history])
+        ax.set_xlabel("Update Step")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        if ylim:
+            ax.set_ylim(ylim)
 
     # Learning rate if available
-    lrs = [m.get("learning_rate", None) for m in metrics_history]
+    lrs = [m.get("learning_rate") for m in metrics_history]
     if lrs[0] is not None:
         axes[1, 1].plot(steps, lrs)
         axes[1, 1].set_xlabel("Update Step")
@@ -471,8 +388,5 @@ def plot_continuous_learning_metrics(
         axes[1, 1].axis("off")
 
     plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-
+    _save_fig(fig, save_path)
     return fig

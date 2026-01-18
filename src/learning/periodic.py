@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
@@ -14,6 +13,24 @@ from torch import Tensor
 from torch.utils.data import DataLoader, TensorDataset
 
 from .replay_buffer import ReplayBuffer
+
+
+def _get_device(model: nn.Module, device: torch.device | str | None) -> torch.device:
+    """Get device, defaulting to model's device."""
+    if device is None:
+        return next(model.parameters()).device
+    return torch.device(device) if isinstance(device, str) else device
+
+
+def _detect_model_type(model: nn.Module) -> tuple[bool, bool]:
+    """Detect if model is SNR-conditioned and/or VAE.
+
+    Returns:
+        Tuple of (is_snr_conditioned, is_vae).
+    """
+    is_snr = hasattr(model, "encoder") and hasattr(model.encoder, "snr_embed")
+    is_vae = hasattr(model, "reparameterize")
+    return is_snr, is_vae
 
 
 class RetrainingTrigger(Enum):
@@ -98,10 +115,7 @@ class PeriodicRetrainer:
         self.replay_ratio = replay_ratio
         self.use_replay = use_replay
         self.gradient_clip_norm = gradient_clip_norm
-
-        if device is None:
-            device = next(model.parameters()).device
-        self.device = torch.device(device) if isinstance(device, str) else device
+        self.device = _get_device(model, device)
 
         # Data buffers
         self._new_samples_buffer: list[dict[str, Tensor]] = []
@@ -113,118 +127,71 @@ class PeriodicRetrainer:
         self._last_retrain_time = time.time()
         self._last_performance = None
         self._retraining_history: list[RetrainingEvent] = []
-
-        # Model type detection
-        self._is_snr_conditioned = hasattr(model, "encoder") and hasattr(
-            model.encoder, "snr_embed"
-        )
-        self._is_vae = hasattr(model, "reparameterize")
+        self._is_snr_conditioned, self._is_vae = _detect_model_type(model)
 
     def add_samples(self, batch: dict[str, Tensor]) -> None:
-        """Add new samples to buffer.
-
-        Args:
-            batch: Dictionary with "iq" and optionally "snr" tensors.
-        """
+        """Add new samples to buffer."""
         batch_size = batch["iq"].size(0)
         self._samples_since_retrain += batch_size
         self._total_samples += batch_size
 
         # Add to new samples buffer
-        self._new_samples_buffer.append({
-            k: v.cpu().clone() for k, v in batch.items()
-            if isinstance(v, Tensor)
-        })
+        self._new_samples_buffer.append({k: v.cpu().clone() for k, v in batch.items() if isinstance(v, Tensor)})
 
         # Add to replay buffer
         if self._replay_buffer is not None:
             for i in range(batch_size):
-                sample = {k: v[i].cpu() for k, v in batch.items() if isinstance(v, Tensor)}
-                self._replay_buffer.add(sample)
+                self._replay_buffer.add({k: v[i].cpu() for k, v in batch.items() if isinstance(v, Tensor)})
 
     def should_retrain(self, current_performance: float | None = None) -> bool:
-        """Check if retraining should be triggered.
-
-        Args:
-            current_performance: Current model performance metric.
-
-        Returns:
-            True if retraining should occur.
-        """
-        if len(self._new_samples_buffer) == 0:
+        """Check if retraining should be triggered based on configured trigger."""
+        if not self._new_samples_buffer:
             return False
 
         if self.trigger == RetrainingTrigger.SAMPLE_COUNT:
             return self._samples_since_retrain >= self.interval
 
-        elif self.trigger == RetrainingTrigger.TIME_INTERVAL:
-            if self.time_interval_seconds is None:
-                return False
-            return (time.time() - self._last_retrain_time) >= self.time_interval_seconds
+        if self.trigger == RetrainingTrigger.TIME_INTERVAL:
+            return self.time_interval_seconds is not None and (
+                time.time() - self._last_retrain_time >= self.time_interval_seconds
+            )
 
-        elif self.trigger == RetrainingTrigger.PERFORMANCE_DROP:
+        if self.trigger == RetrainingTrigger.PERFORMANCE_DROP:
             if current_performance is None or self.performance_threshold is None:
                 return False
             if self._last_performance is None:
                 self._last_performance = current_performance
                 return False
-            drop = self._last_performance - current_performance
-            return drop > self.performance_threshold
+            return (self._last_performance - current_performance) > self.performance_threshold
 
-        elif self.trigger == RetrainingTrigger.DISTRIBUTION_SHIFT:
-            # Would require distribution monitoring - simplified version
-            return self._samples_since_retrain >= self.interval
+        # DISTRIBUTION_SHIFT uses simplified sample-based trigger
+        return self._samples_since_retrain >= self.interval
 
-        return False
-
-    def retrain(
-        self,
-        validation_fn: Callable[[nn.Module], dict] | None = None,
-    ) -> RetrainingEvent:
-        """Perform retraining on buffered data.
-
-        Args:
-            validation_fn: Optional function to compute validation metrics.
-
-        Returns:
-            RetrainingEvent with details of the retraining.
-        """
+    def retrain(self, validation_fn: Callable[[nn.Module], dict] | None = None) -> RetrainingEvent:
+        """Perform retraining on buffered data."""
         start_time = time.time()
+        metrics_before = validation_fn(self.model) if validation_fn else {}
 
-        # Get metrics before
-        metrics_before = {}
-        if validation_fn is not None:
-            metrics_before = validation_fn(self.model)
-
-        # Prepare training data
+        # Prepare training data and optimizer
         train_loader = self._prepare_dataloader()
-
-        # Create optimizer
-        optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.learning_rate,
-        )
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
 
         # Training loop
         self.model.train()
         for epoch in range(self.epochs_per_retrain):
             for batch in train_loader:
-                loss = self._train_step(batch, optimizer)
+                self._train_step(batch, optimizer)
 
-        # Get metrics after
-        metrics_after = {}
-        if validation_fn is not None:
-            metrics_after = validation_fn(self.model)
+        metrics_after = validation_fn(self.model) if validation_fn else {}
 
         # Update state
         self._samples_since_retrain = 0
         self._last_retrain_time = time.time()
         self._new_samples_buffer = []
-
         if metrics_after.get("loss") is not None:
             self._last_performance = -metrics_after["loss"]  # Higher is better
 
-        # Create event
+        # Create and store event
         event = RetrainingEvent(
             timestamp=time.time(),
             trigger=self.trigger,
@@ -234,28 +201,19 @@ class PeriodicRetrainer:
             duration=time.time() - start_time,
         )
         self._retraining_history.append(event)
-
         return event
 
     def _prepare_dataloader(self) -> DataLoader:
-        """Prepare dataloader from buffered samples.
-
-        Returns:
-            DataLoader for retraining.
-        """
+        """Prepare dataloader from buffered samples with optional replay."""
         # Concatenate new samples
         all_iq = torch.cat([b["iq"] for b in self._new_samples_buffer], dim=0)
-        all_snr = None
-        if "snr" in self._new_samples_buffer[0]:
-            all_snr = torch.cat([b["snr"] for b in self._new_samples_buffer], dim=0)
+        all_snr = torch.cat([b["snr"] for b in self._new_samples_buffer], dim=0) if "snr" in self._new_samples_buffer[0] else None
 
         # Mix with replay buffer
-        if self.use_replay and self._replay_buffer is not None:
-            replay_size = int(len(all_iq) * self.replay_ratio)
-            if replay_size > 0 and len(self._replay_buffer) > 0:
-                replay_samples = self._replay_buffer.sample(
-                    min(replay_size, len(self._replay_buffer))
-                )
+        if self.use_replay and self._replay_buffer and len(self._replay_buffer) > 0:
+            replay_size = min(int(len(all_iq) * self.replay_ratio), len(self._replay_buffer))
+            if replay_size > 0:
+                replay_samples = self._replay_buffer.sample(replay_size)
                 replay_iq = torch.stack([s["iq"] for s in replay_samples])
                 all_iq = torch.cat([all_iq, replay_iq], dim=0)
 
@@ -264,42 +222,18 @@ class PeriodicRetrainer:
                     all_snr = torch.cat([all_snr, replay_snr], dim=0)
 
         # Create dataset and loader
-        if all_snr is not None:
-            dataset = TensorDataset(all_iq, all_snr)
-        else:
-            dataset = TensorDataset(all_iq)
+        dataset = TensorDataset(all_iq, all_snr) if all_snr is not None else TensorDataset(all_iq)
+        return DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=False)
 
-        return DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            drop_last=False,
-        )
-
-    def _train_step(
-        self,
-        batch: tuple[Tensor, ...],
-        optimizer: torch.optim.Optimizer,
-    ) -> float:
-        """Single training step.
-
-        Args:
-            batch: Tuple of tensors from dataloader.
-            optimizer: Optimizer.
-
-        Returns:
-            Loss value.
-        """
+    def _train_step(self, batch: tuple[Tensor, ...], optimizer: torch.optim.Optimizer) -> float:
+        """Single training step."""
         iq = batch[0].to(self.device)
         snr = batch[1].to(self.device) if len(batch) > 1 else None
 
         optimizer.zero_grad()
 
-        if self._is_snr_conditioned and snr is not None:
-            x_recon, mu, logvar, _ = self.model(iq, snr)
-            loss, _, _ = self.model.loss(iq, x_recon, mu, logvar)
-        elif self._is_vae:
-            x_recon, mu, logvar, _ = self.model(iq)
+        if self._is_vae:
+            x_recon, mu, logvar, _ = self.model(iq, snr) if self._is_snr_conditioned and snr is not None else self.model(iq)
             loss, _, _ = self.model.loss(iq, x_recon, mu, logvar)
         else:
             x_recon, _ = self.model(iq)
@@ -308,20 +242,13 @@ class PeriodicRetrainer:
         loss.backward()
 
         if self.gradient_clip_norm is not None:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.gradient_clip_norm
-            )
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_norm)
 
         optimizer.step()
-
         return loss.item()
 
     def get_stats(self) -> dict:
-        """Get retrainer statistics.
-
-        Returns:
-            Dictionary with statistics.
-        """
+        """Get retrainer statistics."""
         return {
             "total_samples": self._total_samples,
             "samples_since_retrain": self._samples_since_retrain,
@@ -332,19 +259,11 @@ class PeriodicRetrainer:
         }
 
     def get_history(self) -> list[RetrainingEvent]:
-        """Get retraining history.
-
-        Returns:
-            List of RetrainingEvent objects.
-        """
+        """Get retraining history."""
         return self._retraining_history
 
     def get_state(self) -> dict:
-        """Get state for checkpointing.
-
-        Returns:
-            State dictionary.
-        """
+        """Get state for checkpointing."""
         return {
             "samples_since_retrain": self._samples_since_retrain,
             "total_samples": self._total_samples,
@@ -354,15 +273,11 @@ class PeriodicRetrainer:
         }
 
     def load_state(self, state: dict) -> None:
-        """Load state from checkpoint.
-
-        Args:
-            state: State dictionary.
-        """
+        """Load state from checkpoint."""
         self._samples_since_retrain = state["samples_since_retrain"]
         self._total_samples = state["total_samples"]
         self._last_retrain_time = state["last_retrain_time"]
         self._last_performance = state["last_performance"]
 
-        if state["replay_buffer"] is not None and self._replay_buffer is not None:
+        if state["replay_buffer"] and self._replay_buffer:
             self._replay_buffer.load_state(state["replay_buffer"])

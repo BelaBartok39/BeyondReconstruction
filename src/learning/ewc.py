@@ -2,13 +2,28 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
-from typing import Iterator
-
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.utils.data import DataLoader
+
+
+def _get_device(model: nn.Module, device: torch.device | str | None) -> torch.device:
+    """Get device, defaulting to model's device."""
+    if device is None:
+        return next(model.parameters()).device
+    return torch.device(device) if isinstance(device, str) else device
+
+
+def _detect_model_type(model: nn.Module) -> tuple[bool, bool]:
+    """Detect if model is SNR-conditioned and/or VAE.
+
+    Returns:
+        Tuple of (is_snr_conditioned, is_vae).
+    """
+    is_snr = hasattr(model, "encoder") and hasattr(model.encoder, "snr_embed")
+    is_vae = hasattr(model, "reparameterize")
+    return is_snr, is_vae
 
 
 class EWCLearner:
@@ -56,21 +71,13 @@ class EWCLearner:
         self.fisher_samples = fisher_samples
         self.online = online
         self.gamma = gamma
-
-        if device is None:
-            device = next(model.parameters()).device
-        self.device = torch.device(device) if isinstance(device, str) else device
+        self.device = _get_device(model, device)
 
         # Storage for Fisher information and parameter snapshots
         self._fisher: dict[str, Tensor] = {}
         self._params_snapshot: dict[str, Tensor] = {}
         self._is_initialized = False
-
-        # Model type detection
-        self._is_snr_conditioned = hasattr(model, "encoder") and hasattr(
-            model.encoder, "snr_embed"
-        )
-        self._is_vae = hasattr(model, "reparameterize")
+        self._is_snr_conditioned, self._is_vae = _detect_model_type(model)
 
     def compute_fisher(
         self,
@@ -86,16 +93,19 @@ class EWCLearner:
             dataloader: DataLoader with representative samples.
             num_samples: Max samples to use (default: fisher_samples).
         """
-        if num_samples is None:
-            num_samples = self.fisher_samples
-
+        num_samples = num_samples or self.fisher_samples
         self.model.eval()
 
-        # Initialize Fisher accumulator
-        fisher_accum: dict[str, Tensor] = {}
-        for name, param in self._named_parameters():
-            fisher_accum[name] = torch.zeros_like(param)
+        # Do a dummy forward pass to initialize any lazy layers
+        first_batch = next(iter(dataloader))
+        dummy_iq = first_batch["iq"][:1].to(self.device)
+        dummy_snr = first_batch.get("snr")
+        dummy_snr = dummy_snr[:1].to(self.device) if dummy_snr is not None else None
+        with torch.no_grad():
+            _ = self._compute_sample_loss(dummy_iq, dummy_snr)
 
+        # Initialize Fisher accumulator (after lazy layers are initialized)
+        fisher_accum = {name: torch.zeros_like(param) for name, param in self._named_parameters()}
         sample_count = 0
 
         for batch in dataloader:
@@ -104,108 +114,76 @@ class EWCLearner:
 
             iq = batch["iq"].to(self.device)
             snr = batch.get("snr")
-            if snr is not None:
-                snr = snr.to(self.device)
+            snr = snr.to(self.device) if snr is not None else None
 
-            batch_size = iq.size(0)
-
-            # Compute loss and gradients
             self.model.zero_grad()
             loss = self._compute_sample_loss(iq, snr)
             loss.backward()
 
             # Accumulate squared gradients (Fisher diagonal approximation)
+            batch_size = iq.size(0)
             for name, param in self._named_parameters():
                 if param.grad is not None:
                     fisher_accum[name] += param.grad.data.pow(2) * batch_size
 
             sample_count += batch_size
 
-        # Normalize
+        # Normalize Fisher values
         for name in fisher_accum:
             fisher_accum[name] /= sample_count
 
-        # Update Fisher (online or replace)
+        # Update Fisher (online EWC uses running average, otherwise replace)
         if self.online and self._is_initialized:
             for name in self._fisher:
-                self._fisher[name] = (
-                    self.gamma * self._fisher[name]
-                    + (1 - self.gamma) * fisher_accum[name]
-                )
+                self._fisher[name] = self.gamma * self._fisher[name] + (1 - self.gamma) * fisher_accum[name]
         else:
             self._fisher = fisher_accum
 
         # Save parameter snapshot
-        self._params_snapshot = {}
-        for name, param in self._named_parameters():
-            self._params_snapshot[name] = param.data.clone()
-
+        self._params_snapshot = {name: param.data.clone() for name, param in self._named_parameters()}
         self._is_initialized = True
 
     def _compute_sample_loss(self, iq: Tensor, snr: Tensor | None) -> Tensor:
-        """Compute loss for Fisher estimation.
-
-        Uses log-likelihood (negative reconstruction loss) for proper
-        Fisher information computation.
-        """
-        if self._is_snr_conditioned and snr is not None:
-            x_recon, mu, logvar, _ = self.model(iq, snr)
-            # Use reconstruction loss only (not KL) for Fisher
-            loss = nn.functional.mse_loss(x_recon, iq, reduction="sum")
-        elif self._is_vae:
-            x_recon, mu, logvar, _ = self.model(iq)
-            loss = nn.functional.mse_loss(x_recon, iq, reduction="sum")
+        """Compute loss for Fisher estimation (reconstruction loss only, not KL)."""
+        if self._is_vae:
+            x_recon, *_ = self.model(iq, snr) if self._is_snr_conditioned and snr is not None else self.model(iq)
         else:
             x_recon, _ = self.model(iq)
-            loss = nn.functional.mse_loss(x_recon, iq, reduction="sum")
-
-        return loss
+        return nn.functional.mse_loss(x_recon, iq, reduction="sum")
 
     def penalty(self) -> Tensor:
-        """Compute EWC penalty term.
-
-        Returns:
-            EWC penalty to add to the loss.
-        """
+        """Compute EWC penalty term to add to the loss."""
         if not self._is_initialized:
             return torch.tensor(0.0, device=self.device)
 
-        penalty = torch.tensor(0.0, device=self.device)
-
-        for name, param in self._named_parameters():
-            if name in self._fisher and name in self._params_snapshot:
-                # Penalize deviation from snapshot weighted by Fisher
-                diff = param - self._params_snapshot[name]
-                penalty += (self._fisher[name] * diff.pow(2)).sum()
-
+        penalty = sum(
+            (self._fisher[name] * (param - self._params_snapshot[name]).pow(2)).sum()
+            for name, param in self._named_parameters()
+            if name in self._fisher and name in self._params_snapshot
+        )
         return self.ewc_lambda * penalty / 2
 
-    def _named_parameters(self) -> Iterator[tuple[str, nn.Parameter]]:
+    def _named_parameters(self):
         """Get named parameters that require gradients."""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                yield name, param
+        return ((n, p) for n, p in self.model.named_parameters() if p.requires_grad)
 
     def get_fisher_stats(self) -> dict:
-        """Get statistics about Fisher information.
-
-        Returns:
-            Dictionary with Fisher statistics.
-        """
+        """Get statistics about Fisher information."""
         if not self._is_initialized:
             return {"initialized": False}
 
-        stats = {"initialized": True, "parameters": {}}
-
-        for name, fisher in self._fisher.items():
-            stats["parameters"][name] = {
-                "mean": float(fisher.mean()),
-                "std": float(fisher.std()),
-                "max": float(fisher.max()),
-                "sparsity": float((fisher < 1e-6).float().mean()),
-            }
-
-        return stats
+        return {
+            "initialized": True,
+            "parameters": {
+                name: {
+                    "mean": float(fisher.mean()),
+                    "std": float(fisher.std()),
+                    "max": float(fisher.max()),
+                    "sparsity": float((fisher < 1e-6).float().mean()),
+                }
+                for name, fisher in self._fisher.items()
+            },
+        }
 
     def get_state(self) -> dict:
         """Get state for checkpointing.
@@ -259,57 +237,35 @@ class EWCTrainer:
         self.ewc = ewc
         self.optimizer = optimizer
         self.gradient_clip_norm = gradient_clip_norm
-
-        if device is None:
-            device = next(model.parameters()).device
-        self.device = torch.device(device) if isinstance(device, str) else device
-
-        self._is_snr_conditioned = hasattr(model, "encoder") and hasattr(
-            model.encoder, "snr_embed"
-        )
-        self._is_vae = hasattr(model, "reparameterize")
+        self.device = _get_device(model, device)
+        self._is_snr_conditioned, self._is_vae = _detect_model_type(model)
 
     def train_step(self, batch: dict[str, Tensor]) -> dict[str, float]:
-        """Perform single training step with EWC.
-
-        Args:
-            batch: Training batch.
-
-        Returns:
-            Dictionary with loss components.
-        """
+        """Perform single training step with EWC."""
         self.model.train()
 
         iq = batch["iq"].to(self.device)
         snr = batch.get("snr")
-        if snr is not None:
-            snr = snr.to(self.device)
+        snr = snr.to(self.device) if snr is not None else None
 
         self.optimizer.zero_grad()
 
         # Compute task loss
-        if self._is_snr_conditioned and snr is not None:
-            x_recon, mu, logvar, _ = self.model(iq, snr)
-            task_loss, recon_loss, kl_loss = self.model.loss(iq, x_recon, mu, logvar)
-        elif self._is_vae:
-            x_recon, mu, logvar, _ = self.model(iq)
+        if self._is_vae:
+            x_recon, mu, logvar, _ = self.model(iq, snr) if self._is_snr_conditioned and snr is not None else self.model(iq)
             task_loss, recon_loss, kl_loss = self.model.loss(iq, x_recon, mu, logvar)
         else:
             x_recon, _ = self.model(iq)
-            task_loss = self.model.reconstruction_loss(iq, x_recon)
-            recon_loss = task_loss
-            kl_loss = torch.tensor(0.0)
+            task_loss = recon_loss = self.model.reconstruction_loss(iq, x_recon)
+            kl_loss = 0.0
 
         # Add EWC penalty
         ewc_penalty = self.ewc.penalty()
         total_loss = task_loss + ewc_penalty
-
         total_loss.backward()
 
         if self.gradient_clip_norm is not None:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.gradient_clip_norm
-            )
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_norm)
 
         self.optimizer.step()
 
@@ -321,27 +277,15 @@ class EWCTrainer:
             "kl_loss": kl_loss.item() if isinstance(kl_loss, Tensor) else kl_loss,
         }
 
-    def train_epoch(
-        self, dataloader: DataLoader, log_interval: int = 100
-    ) -> dict[str, float]:
-        """Train for one epoch.
-
-        Args:
-            dataloader: Training data.
-            log_interval: Logging interval.
-
-        Returns:
-            Average metrics for epoch.
-        """
+    def train_epoch(self, dataloader: DataLoader, log_interval: int = 100) -> dict[str, float]:
+        """Train for one epoch and return average metrics."""
         metrics_sum = {}
         batch_count = 0
 
         for batch in dataloader:
             batch_metrics = self.train_step(batch)
             batch_count += 1
-
             for key, value in batch_metrics.items():
                 metrics_sum[key] = metrics_sum.get(key, 0.0) + value
 
-        # Average metrics
         return {k: v / batch_count for k, v in metrics_sum.items()}
