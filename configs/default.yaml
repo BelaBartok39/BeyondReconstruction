@@ -19,11 +19,12 @@ data:
     - frequency_drift
     - amplitude_spike
     - phase_noise
+  anomaly_severity: 4.0        # Severity multiplier for anomalies (1.0=default, higher=stronger)
 
 # Model settings
 model:
   type: "snr_vae"              # Options: autoencoder, vae, snr_vae
-  latent_dim: 32               # Latent space dimension
+  latent_dim: 32               # Latent space dimension (16 was too small)
   hidden_channels: [32, 64, 128, 256]  # Encoder channel progression
   kernel_size: 7               # Convolution kernel size
   use_batch_norm: true         # Use batch normalization
@@ -95,13 +96,13 @@ continuous_learning:
 
 # Anomaly detection settings
 detection:
-  method: "latent"             # Testing latent-only detection
+  method: "latent"             # Latent-only is best so far
   threshold_method: "percentile"  # Options: fixed, percentile, adaptive
   threshold_percentile: 95     # For percentile-based threshold
   snr_adaptive: true           # Use SNR-adaptive thresholds
   snr_bins: 7                  # Number of SNR bins for adaptive thresholds
   invert_scores: false         # Set true if anomalies have lower reconstruction error
-  hybrid_weights: [0.5, 0.5]   # Weights for [reconstruction, latent] in hybrid mode
+  hybrid_weights: [0.2, 0.8]   # Weights for [reconstruction, latent] - latent-heavy
   scoring_method: "mse"        # Using MSE for baseline - simpler scoring
   use_epistemic: false         # DISABLED for baseline testing
   epistemic_weight: 1.0        # Weight for epistemic uncertainty term

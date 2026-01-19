@@ -21,7 +21,8 @@ def _detect_model_type(model: nn.Module) -> tuple[bool, bool]:
     Returns:
         Tuple of (is_snr_conditioned, is_vae).
     """
-    is_snr = hasattr(model, "encoder") and hasattr(model.encoder, "snr_embed")
+    # SNRConditionedVAE uses cond_embed in encoder for conditioning
+    is_snr = hasattr(model, "encoder") and hasattr(model.encoder, "cond_embed")
     is_vae = hasattr(model, "reparameterize")
     return is_snr, is_vae
 
@@ -101,8 +102,10 @@ class EWCLearner:
         dummy_iq = first_batch["iq"][:1].to(self.device)
         dummy_snr = first_batch.get("snr")
         dummy_snr = dummy_snr[:1].to(self.device) if dummy_snr is not None else None
+        dummy_power = first_batch.get("power")
+        dummy_power = dummy_power[:1].to(self.device) if dummy_power is not None else None
         with torch.no_grad():
-            _ = self._compute_sample_loss(dummy_iq, dummy_snr)
+            _ = self._compute_sample_loss(dummy_iq, dummy_snr, dummy_power)
 
         # Initialize Fisher accumulator (after lazy layers are initialized)
         fisher_accum = {name: torch.zeros_like(param) for name, param in self._named_parameters()}
@@ -115,9 +118,11 @@ class EWCLearner:
             iq = batch["iq"].to(self.device)
             snr = batch.get("snr")
             snr = snr.to(self.device) if snr is not None else None
+            power = batch.get("power")
+            power = power.to(self.device) if power is not None else None
 
             self.model.zero_grad()
-            loss = self._compute_sample_loss(iq, snr)
+            loss = self._compute_sample_loss(iq, snr, power)
             loss.backward()
 
             # Accumulate squared gradients (Fisher diagonal approximation)
@@ -143,10 +148,18 @@ class EWCLearner:
         self._params_snapshot = {name: param.data.clone() for name, param in self._named_parameters()}
         self._is_initialized = True
 
-    def _compute_sample_loss(self, iq: Tensor, snr: Tensor | None) -> Tensor:
+    def _compute_sample_loss(self, iq: Tensor, snr: Tensor | None, power: Tensor | None = None) -> Tensor:
         """Compute loss for Fisher estimation (reconstruction loss only, not KL)."""
         if self._is_vae:
-            x_recon, *_ = self.model(iq, snr) if self._is_snr_conditioned and snr is not None else self.model(iq)
+            if self._is_snr_conditioned:
+                # SNR-conditioned models always need SNR and power
+                if snr is None:
+                    snr = torch.full((iq.size(0),), 0.5, device=iq.device)
+                if power is None:
+                    power = torch.full((iq.size(0),), 0.5, device=iq.device)
+                x_recon, *_ = self.model(iq, snr, power)
+            else:
+                x_recon, *_ = self.model(iq)
         else:
             x_recon, _ = self.model(iq)
         return nn.functional.mse_loss(x_recon, iq, reduction="sum")

@@ -28,7 +28,8 @@ def _detect_model_type(model: nn.Module) -> tuple[bool, bool]:
     Returns:
         Tuple of (is_snr_conditioned, is_vae).
     """
-    is_snr = hasattr(model, "encoder") and hasattr(model.encoder, "snr_embed")
+    # SNRConditionedVAE uses cond_embed in encoder for conditioning
+    is_snr = hasattr(model, "encoder") and hasattr(model.encoder, "cond_embed")
     is_vae = hasattr(model, "reparameterize")
     return is_snr, is_vae
 
@@ -208,6 +209,7 @@ class PeriodicRetrainer:
         # Concatenate new samples
         all_iq = torch.cat([b["iq"] for b in self._new_samples_buffer], dim=0)
         all_snr = torch.cat([b["snr"] for b in self._new_samples_buffer], dim=0) if "snr" in self._new_samples_buffer[0] else None
+        all_power = torch.cat([b["power"] for b in self._new_samples_buffer], dim=0) if "power" in self._new_samples_buffer[0] else None
 
         # Mix with replay buffer
         if self.use_replay and self._replay_buffer and len(self._replay_buffer) > 0:
@@ -221,20 +223,45 @@ class PeriodicRetrainer:
                     replay_snr = torch.stack([s["snr"] for s in replay_samples])
                     all_snr = torch.cat([all_snr, replay_snr], dim=0)
 
+                if all_power is not None and "power" in replay_samples[0]:
+                    replay_power = torch.stack([s["power"] for s in replay_samples])
+                    all_power = torch.cat([all_power, replay_power], dim=0)
+
         # Create dataset and loader
-        dataset = TensorDataset(all_iq, all_snr) if all_snr is not None else TensorDataset(all_iq)
+        tensors = [all_iq]
+        if all_snr is not None:
+            tensors.append(all_snr)
+        if all_power is not None:
+            tensors.append(all_power)
+        dataset = TensorDataset(*tensors)
         return DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=False)
 
     def _train_step(self, batch: tuple[Tensor, ...], optimizer: torch.optim.Optimizer) -> float:
         """Single training step."""
         iq = batch[0].to(self.device)
         snr = batch[1].to(self.device) if len(batch) > 1 else None
+        power = batch[2].to(self.device) if len(batch) > 2 else None
 
         optimizer.zero_grad()
 
         if self._is_vae:
-            x_recon, mu, logvar, _ = self.model(iq, snr) if self._is_snr_conditioned and snr is not None else self.model(iq)
-            loss, _, _ = self.model.loss(iq, x_recon, mu, logvar)
+            if self._is_snr_conditioned:
+                # SNR-conditioned models always need SNR and power
+                if snr is None:
+                    snr = torch.full((iq.size(0),), 0.5, device=iq.device)
+                if power is None:
+                    power = torch.full((iq.size(0),), 0.5, device=iq.device)
+                result = self.model(iq, snr, power)
+                # Handle probabilistic decoder (5 outputs) vs non-probabilistic (4 outputs)
+                if len(result) == 5:
+                    x_mean, x_logvar, mu, logvar, _ = result
+                    loss, _, _ = self.model.loss(iq, x_mean, mu, logvar, x_logvar)
+                else:
+                    x_recon, mu, logvar, _ = result
+                    loss, _, _ = self.model.loss(iq, x_recon, mu, logvar)
+            else:
+                x_recon, mu, logvar, _ = self.model(iq)
+                loss, _, _ = self.model.loss(iq, x_recon, mu, logvar)
         else:
             x_recon, _ = self.model(iq)
             loss = self.model.reconstruction_loss(iq, x_recon)

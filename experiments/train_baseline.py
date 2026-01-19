@@ -363,6 +363,10 @@ def main():
 
     # Create data loaders
     logger.info("Creating data loaders...")
+    # Get anomaly severity from config (default 1.0)
+    anomaly_severity = getattr(config.data, "anomaly_severity", 1.0)
+    logger.info(f"Anomaly severity: {anomaly_severity}")
+
     if args.semi_supervised:
         # For semi-supervised, include some anomalies in training data
         logger.info(f"Semi-supervised mode: {args.train_anomaly_ratio:.0%} anomalies in training")
@@ -373,18 +377,21 @@ def main():
             snr_range=tuple(config.data.snr_range),
             modulations=config.data.modulations,
             anomaly_types=config.data.anomaly_types,
+            anomaly_severity=anomaly_severity,
         )
         val_dataset = RFDataset.from_generator(
             generator=generator,
             num_samples=config.data.num_val_samples,
             anomaly_ratio=config.data.anomaly_ratio,
             snr_range=tuple(config.data.snr_range),
+            anomaly_severity=anomaly_severity,
         )
         test_dataset = RFDataset.from_generator(
             generator=generator,
             num_samples=config.data.num_test_samples,
             anomaly_ratio=config.data.anomaly_ratio,
             snr_range=tuple(config.data.snr_range),
+            anomaly_severity=anomaly_severity,
         )
         train_loader = DataLoader(train_dataset, batch_size=config.training.batch_size, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=config.training.batch_size)

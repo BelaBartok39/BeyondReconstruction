@@ -139,6 +139,7 @@ class RFDataset(Dataset):
         anomaly_types: list[str] | None = None,
         augmentor: RFAugmentor | None = None,
         power_range: tuple[float, float] = (-20, 10),
+        anomaly_severity: float = 1.0,
     ) -> "RFDataset":
         """Create dataset using synthetic generator.
 
@@ -151,6 +152,7 @@ class RFDataset(Dataset):
             anomaly_types: List of anomaly types.
             augmentor: Optional augmentation pipeline.
             power_range: Power range for normalization (dB).
+            anomaly_severity: Severity multiplier for anomalies (1.0=default).
 
         Returns:
             RFDataset instance.
@@ -161,6 +163,7 @@ class RFDataset(Dataset):
             modulations=modulations,
             snr_range=snr_range,
             anomaly_types=anomaly_types,
+            anomaly_severity=anomaly_severity,
         )
 
         labels = np.array([1 if m.is_anomaly else 0 for m in metadata], dtype=np.int64)
@@ -337,11 +340,15 @@ def create_dataloaders(
             seed=config.experiment.seed,
         )
 
+    # Get anomaly severity from config (default 1.0)
+    anomaly_severity = getattr(config.data, "anomaly_severity", 1.0)
+
     common_params = {
         "generator": generator,
         "modulations": config.data.modulations,
         "snr_range": tuple(config.data.snr_range),
         "anomaly_types": config.data.anomaly_types,
+        "anomaly_severity": anomaly_severity,
     }
 
     # Create datasets

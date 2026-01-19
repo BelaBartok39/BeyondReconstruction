@@ -496,6 +496,7 @@ class SyntheticRFGenerator:
         modulations: list[str] | None = None,
         snr_range: tuple[float, float] = (-5, 30),
         anomaly_types: list[str] | None = None,
+        anomaly_severity: float = 1.0,
     ) -> tuple[NDArray[np.float32], list[SignalMetadata]]:
         """Generate a batch of signals.
 
@@ -505,6 +506,7 @@ class SyntheticRFGenerator:
             modulations: List of modulations to use. If None, uses all.
             snr_range: Range for random SNR selection.
             anomaly_types: List of anomaly types. If None, uses all.
+            anomaly_severity: Severity multiplier for anomalies (1.0=default, higher=stronger).
 
         Returns:
             Tuple of (IQ array [N, 2, seq_len], list of metadata).
@@ -529,7 +531,7 @@ class SyntheticRFGenerator:
             signals.append(iq)
             metadata_list.append(meta)
 
-        # Generate anomalous signals
+        # Generate anomalous signals with specified severity
         for _ in range(num_anomalies):
             mod = self.rng.choice(modulations)
             anom_type = self.rng.choice(anomaly_types)
@@ -537,6 +539,7 @@ class SyntheticRFGenerator:
                 anomaly_type=anom_type,
                 base_modulation=mod,
                 snr_range=snr_range,
+                severity=anomaly_severity,
             )
             signals.append(iq)
             metadata_list.append(meta)

@@ -40,7 +40,8 @@ logger = logging.getLogger(__name__)
 
 def get_model_capabilities(model: nn.Module) -> tuple[bool, bool]:
     """Detect model capabilities once."""
-    is_snr_conditioned = hasattr(model, "encoder") and hasattr(model.encoder, "snr_embed")
+    # SNRConditionedVAE has cond_embed in encoder for conditioning
+    is_snr_conditioned = hasattr(model, "encoder") and hasattr(model.encoder, "cond_embed")
     is_vae = hasattr(model, "reparameterize")
     return is_snr_conditioned, is_vae
 
@@ -49,12 +50,20 @@ def model_forward(
     model: nn.Module,
     iq: torch.Tensor,
     snr: torch.Tensor | None,
+    power: torch.Tensor | None,
     is_snr_conditioned: bool,
     is_vae: bool,
 ) -> torch.Tensor:
     """Unified forward pass returning reconstruction only."""
-    if is_snr_conditioned and snr is not None:
-        x_recon, _, _, _ = model(iq, snr)
+    if is_snr_conditioned:
+        # SNR-conditioned models always need SNR - use default 0.5 if not provided
+        if snr is None:
+            snr = torch.full((iq.size(0),), 0.5, device=iq.device)
+        if power is None:
+            power = torch.full((iq.size(0),), 0.5, device=iq.device)
+        result = model(iq, snr, power)
+        # Handle both probabilistic (5 outputs) and non-probabilistic (4 outputs)
+        x_recon = result[0]  # First output is always reconstruction (or mean)
     elif is_vae:
         x_recon, _, _, _ = model(iq)
     else:
@@ -66,13 +75,25 @@ def compute_task_loss(
     model: nn.Module,
     iq: torch.Tensor,
     snr: torch.Tensor | None,
+    power: torch.Tensor | None,
     is_snr_conditioned: bool,
     is_vae: bool,
 ) -> torch.Tensor:
     """Compute task loss for any model type."""
-    if is_snr_conditioned and snr is not None:
-        x_recon, mu, logvar, _ = model(iq, snr)
-        loss, _, _ = model.loss(iq, x_recon, mu, logvar)
+    if is_snr_conditioned:
+        # SNR-conditioned models always need SNR - use default 0.5 if not provided
+        if snr is None:
+            snr = torch.full((iq.size(0),), 0.5, device=iq.device)
+        if power is None:
+            power = torch.full((iq.size(0),), 0.5, device=iq.device)
+        result = model(iq, snr, power)
+        # Handle both probabilistic (5 outputs) and non-probabilistic (4 outputs)
+        if len(result) == 5:
+            x_mean, x_logvar, mu, logvar, _ = result
+            loss, _, _ = model.loss(iq, x_mean, mu, logvar, x_logvar)
+        else:
+            x_recon, mu, logvar, _ = result
+            loss, _, _ = model.loss(iq, x_recon, mu, logvar)
     elif is_vae:
         x_recon, mu, logvar, _ = model(iq)
         loss, _, _ = model.loss(iq, x_recon, mu, logvar)
@@ -104,9 +125,20 @@ def get_device() -> torch.device:
 def load_baseline_model(checkpoint_path: str, config, device: torch.device) -> nn.Module:
     """Load trained baseline model."""
     model = create_model(config)
+    model = model.to(device)
+
+    # Initialize lazy layers with dummy forward pass
+    dummy_iq = torch.randn(1, 2, config.data.sequence_length, device=device)
+    dummy_snr = torch.rand(1, device=device)
+    dummy_power = torch.rand(1, device=device) if getattr(config.model, "use_power_conditioning", False) else None
+    with torch.no_grad():
+        if dummy_power is not None:
+            _ = model(dummy_iq, dummy_snr, dummy_power)
+        else:
+            _ = model(dummy_iq, dummy_snr)
+
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
-    model = model.to(device)
     return model
 
 
@@ -123,8 +155,11 @@ def evaluate_model(model: nn.Module, test_loader: DataLoader, device: torch.devi
             snr = batch.get("snr")
             if snr is not None:
                 snr = snr.to(device)
+            power = batch.get("power")
+            if power is not None:
+                power = power.to(device)
 
-            x_recon = model_forward(model, iq, snr, is_snr_conditioned, is_vae)
+            x_recon = model_forward(model, iq, snr, power, is_snr_conditioned, is_vae)
             error = ((iq - x_recon) ** 2).mean(dim=(1, 2))
 
             all_scores.append(error.cpu())
@@ -195,7 +230,7 @@ def run_online_ewc_learning(
 
     ewc = EWCLearner(
         model=model,
-        ewc_lambda=config.continuous_learning.ewc.lambda_,
+        ewc_lambda=getattr(config.continuous_learning.ewc, "lambda", 1000.0),
         fisher_samples=config.continuous_learning.ewc.fisher_samples,
         device=device,
     )
@@ -214,9 +249,12 @@ def run_online_ewc_learning(
         snr = batch.get("snr")
         if snr is not None:
             snr = snr.to(device)
+        power = batch.get("power")
+        if power is not None:
+            power = power.to(device)
 
         optimizer.zero_grad()
-        task_loss = compute_task_loss(model, iq, snr, is_snr_conditioned, is_vae)
+        task_loss = compute_task_loss(model, iq, snr, power, is_snr_conditioned, is_vae)
         loss = task_loss + ewc.penalty()
         loss.backward()
         optimizer.step()
@@ -330,9 +368,12 @@ def run_online_ucl_learning(
         snr = batch.get("snr")
         if snr is not None:
             snr = snr.to(device)
+        power = batch.get("power")
+        if power is not None:
+            power = power.to(device)
 
         optimizer.zero_grad()
-        task_loss = compute_task_loss(model, iq, snr, is_snr_conditioned, is_vae)
+        task_loss = compute_task_loss(model, iq, snr, power, is_snr_conditioned, is_vae)
         loss = task_loss + ucl.penalty()
         loss.backward()
         optimizer.step()

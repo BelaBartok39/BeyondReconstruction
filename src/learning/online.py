@@ -23,7 +23,8 @@ def _detect_model_type(model: nn.Module) -> tuple[bool, bool]:
     Returns:
         Tuple of (is_snr_conditioned, is_vae).
     """
-    is_snr = hasattr(model, "encoder") and hasattr(model.encoder, "snr_embed")
+    # SNRConditionedVAE uses cond_embed in encoder for conditioning
+    is_snr = hasattr(model, "encoder") and hasattr(model.encoder, "cond_embed")
     is_vae = hasattr(model, "reparameterize")
     return is_snr, is_vae
 
@@ -108,9 +109,11 @@ class OnlineLearner:
         iq = batch["iq"].to(self.device)
         snr = batch.get("snr")
         snr = snr.to(self.device) if snr is not None else None
+        power = batch.get("power")
+        power = power.to(self.device) if power is not None else None
 
         # Forward pass
-        loss = self._compute_loss(iq, snr)
+        loss = self._compute_loss(iq, snr, power)
 
         # Scale loss for gradient accumulation
         scaled_loss = loss / self.gradient_accumulation_steps
@@ -142,11 +145,26 @@ class OnlineLearner:
             "batch_count": self._batch_count,
         }
 
-    def _compute_loss(self, iq: Tensor, snr: Tensor | None) -> Tensor:
+    def _compute_loss(self, iq: Tensor, snr: Tensor | None, power: Tensor | None = None) -> Tensor:
         """Compute reconstruction loss based on model type."""
         if self._is_vae:
-            x_recon, mu, logvar, _ = self.model(iq, snr) if self._is_snr_conditioned and snr is not None else self.model(iq)
-            loss, _, _ = self.model.loss(iq, x_recon, mu, logvar)
+            if self._is_snr_conditioned:
+                # SNR-conditioned models always need SNR and power
+                if snr is None:
+                    snr = torch.full((iq.size(0),), 0.5, device=iq.device)
+                if power is None:
+                    power = torch.full((iq.size(0),), 0.5, device=iq.device)
+                result = self.model(iq, snr, power)
+                # Handle probabilistic decoder (5 outputs) vs non-probabilistic (4 outputs)
+                if len(result) == 5:
+                    x_mean, x_logvar, mu, logvar, _ = result
+                    loss, _, _ = self.model.loss(iq, x_mean, mu, logvar, x_logvar)
+                else:
+                    x_recon, mu, logvar, _ = result
+                    loss, _, _ = self.model.loss(iq, x_recon, mu, logvar)
+            else:
+                x_recon, mu, logvar, _ = self.model(iq)
+                loss, _, _ = self.model.loss(iq, x_recon, mu, logvar)
         else:
             x_recon, _ = self.model(iq)
             loss = self.model.reconstruction_loss(iq, x_recon)
