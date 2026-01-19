@@ -1,8 +1,12 @@
 # RF Anomaly Detection: A Learning Journey
 
-## From 42% to 96% AUROC - How We Got Here
+**Last Updated:** 2026-01-18
+
+## From 42% to 95.5% AUROC - How We Got Here
 
 This document chronicles our research journey developing an unsupervised anomaly detection system for RF signals. Each section explains what we discovered, why it mattered, and the concepts involved in accessible terms.
+
+**Final Result:** 0.9549 average AUROC with hybrid detection (validated on cluster)
 
 ---
 
@@ -507,13 +511,51 @@ Week 4: Conditioning + Hybrid methods
 
 | Problem | Solution | Improvement |
 |---------|----------|-------------|
-| Reconstruction works backwards | Use latent space instead | +49% AUROC |
+| Reconstruction works backwards | Use latent space instead | 0.42 → 0.93 AUROC |
 | Normalization hides amplitude | Add power conditioning | +3% AUROC |
-| Phase info lost in real values | Add frequency features at detection | +2% AUROC |
+| Phase info lost in real values | Add frequency features at detection | 0.93 → 0.9549 AUROC |
 | Phase loss during training | Don't do it - destabilizes | (failed) |
 | Complex-valued networks | Not worth the instability | (failed) |
 
 ---
 
+## Session 6 Validation Results (2026-01-18)
+
+### Overfitting Validation: PASS ✓
+
+| Test | Latent-Only | Hybrid(f=0.5) |
+|------|-------------|---------------|
+| Seed Stability | 0.9308 ± 0.0115 | **0.9454 ± 0.0092** |
+| Frequency Drift | 0.8004 | **0.8329** |
+| Subtle Anomalies (sev=1.0) | 0.8393 | **0.8934** |
+| Low SNR (-10 to 10 dB) | 0.7186 | **0.7735** |
+
+### Continuous Learning: Hybrid Improves All Methods
+
+| Method | Latent | Hybrid | Improvement |
+|--------|--------|--------|-------------|
+| No Adaptation | 0.8363 | 0.8858 | +5.0% |
+| Online Learning | 0.8015 | 0.8395 | +3.8% |
+| Online + EWC | 0.7799 | 0.8390 | +5.9% |
+
+### Production Model
+```
+snr_conditioned_vae_hybrid_v1.pt (21 MB)
+```
+
+---
+
+## Next Challenge: Frequency Drift to 0.9+
+
+Current: **0.8467** | Target: **0.9+**
+
+Frequency drift is the hardest anomaly because its signature (phase variance) overlaps with normal signal variation. Proposed approaches:
+1. Adaptive weighting based on detected phase instability
+2. Specialized drift features (chirp rate, phase unwrapping)
+3. Two-stage detection (detect first, then classify)
+
+---
+
 *Document created: January 2026*
 *Research collaboration with Claude (Anthropic)*
+*Last validated: 2026-01-18 (Jobs 1988564, 1988565)*

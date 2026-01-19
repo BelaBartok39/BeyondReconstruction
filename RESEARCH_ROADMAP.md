@@ -1,16 +1,27 @@
 # Research Roadmap for Academic Publishing
 
+**Last Updated:** 2026-01-18
+
 ## Current State Summary
 
 **Achieved Results:**
-- 0.91+ AUROC on synthetic RF anomaly detection
-- 0.93 ± 0.01 AUROC across 5 different random seeds
-- Generalizes to unseen anomaly types (burst_noise: 0.9999 AUROC)
-- Online learning improves drift adaptation (0.8363 → 0.8397 under concept drift)
+- **0.9549 average AUROC** with hybrid detection (latent + frequency features)
+- **0.9454 ± 0.0092** AUROC across 5 random seeds (hybrid)
+- Generalizes to unseen anomaly types (burst_noise: 0.9970 AUROC)
+- Hybrid detection improves continuous learning by 3.8-5.9%
+- **Frequency drift detection: 0.9245 AUROC** with ChirpDetector (up from 0.79 baseline)
 
-**Key Innovation:**
-- Latent-only detection (Mahalanobis distance) dramatically outperforms reconstruction-based methods
-- SNR and power conditioning enables robust detection across varying signal conditions
+**Key Innovations:**
+1. **Latent-only detection** (Mahalanobis distance) outperforms reconstruction-based (0.93 vs 0.42)
+2. **Hybrid detection** adds frequency features at inference time (+2.7% average AUROC)
+3. **SNR and power conditioning** enables robust detection across signal conditions
+4. **No retraining needed** - frequency features added at detection time
+5. **ChirpDetector** - specialized detector achieving 0.9245 AUROC on frequency drift
+
+**Production Model Available:**
+```
+snr_conditioned_vae_hybrid_v1.pt (21 MB)
+```
 
 ---
 
@@ -42,11 +53,14 @@
 #### 1.3 Ablation Studies
 **Demonstrates contribution of each component**
 
-- [ ] SNR conditioning vs no conditioning
-- [ ] Power conditioning impact
-- [ ] Latent dimension sensitivity (8, 16, 32, 64, 128)
+- [x] SNR conditioning vs no conditioning (validated)
+- [x] Power conditioning impact (critical for amplitude anomalies)
+- [x] Latent dimension sensitivity - 32 optimal (16 gave 0.40 AUROC!)
 - [ ] Architecture depth study
-- [ ] Detection method comparison (reconstruction vs latent vs hybrid)
+- [x] Detection method comparison (reconstruction vs latent vs hybrid)
+  - Reconstruction: 0.42 AUROC
+  - Latent-only: 0.93 AUROC
+  - Hybrid(f=0.5): 0.9549 AUROC
 
 ---
 
@@ -55,12 +69,16 @@
 #### 2.1 Why Latent-Only Detection Works
 **Explain the phenomenon**
 
-- [ ] Analyze latent space geometry for normal vs anomaly
-- [ ] Visualize with t-SNE/UMAP
-- [ ] Measure latent space separability metrics
-- [ ] Compare reconstruction error distributions
+- [x] Analyze latent space geometry for normal vs anomaly
+- [x] Visualize with t-SNE/UMAP (see `figures/latent_tsne_by_type.png`)
+- [x] Measure latent space separability metrics (Mahalanobis distances documented)
+- [x] Compare reconstruction error distributions
 
-**Hypothesis:** VAE latent space captures signal structure; anomalies have unusual structure even when reconstructable.
+**Findings:**
+- Anomalies cluster in latent space even when reconstruction error is LOW
+- Amplitude_spike/burst_noise: Mahalanobis ~30 (easily separated)
+- Frequency_drift: Mahalanobis ~8 (overlaps with normal ~5.5, harder to detect)
+- VAE reconstructs anomalies BETTER than normal signals (inverted behavior)
 
 #### 2.2 Mathematical Formalization
 **Strengthens theoretical contribution**
@@ -146,13 +164,26 @@
 
 #### 4.3 Key Claims to Support
 1. **Claim:** Latent-only detection outperforms reconstruction-based
-   - Evidence: 0.91 vs 0.42 AUROC comparison
+   - Evidence: 0.93 vs 0.42 AUROC comparison (2.2x improvement)
 
-2. **Claim:** Model generalizes to unseen anomaly types
-   - Evidence: burst_noise 0.9999 AUROC (never seen in training)
+2. **Claim:** Hybrid detection further improves performance
+   - Evidence: 0.9549 AUROC (+2.7% over latent-only)
+   - Frequency drift: 0.8467 (+5.6% improvement)
+   - No degradation on other anomaly types
 
-3. **Claim:** Continuous learning enables drift adaptation
-   - Evidence: 0.8363 → 0.8397 AUROC improvement under drift
+3. **Claim:** Model generalizes to unseen anomaly types
+   - Evidence: burst_noise 0.9970 AUROC (never seen in training)
+   - Negative generalization gap (-0.053): better on unseen!
+
+4. **Claim:** Hybrid detection improves continuous learning
+   - Evidence: All methods improve 3.8-5.9% with hybrid detection
+   - Online learning: 0.8015 → 0.8395 AUROC
+   - EWC: 0.7799 → 0.8390 AUROC
+
+5. **Claim:** Detection-time features are safer than training modifications
+   - Evidence: Phase loss during training caused loss explosion (0.6 → 79M)
+   - Complex-valued networks produced NaN values
+   - Adding features at detection time: no risk, consistent improvement
 
 ---
 
@@ -161,16 +192,17 @@
 ### For Reproducibility
 - [ ] Add comprehensive docstrings
 - [ ] Create requirements.txt with pinned versions
-- [ ] Add unit tests for all components
+- [x] Add unit tests for all components (50 tests passing)
 - [ ] Create Docker container for reproducibility
-- [ ] Document all hyperparameters in config
+- [x] Document all hyperparameters in config (`configs/default.yaml`)
 
 ### For Open Source Release
-- [ ] Clean up experimental code
+- [x] Clean up experimental code (57 files removed in Session 6)
 - [ ] Add examples/tutorials
-- [ ] Create comprehensive README
+- [x] Create comprehensive README
 - [ ] Add license (MIT or Apache 2.0)
 - [ ] Prepare for GitHub release
+- [x] Export production model (`snr_conditioned_vae_hybrid_v1.pt`)
 
 ---
 
@@ -204,7 +236,33 @@
 
 ## Immediate Action Items
 
-1. **Today:** Acquire RadioML dataset or similar real RF data
-2. **This week:** Implement baseline comparisons
-3. **Next week:** Run ablation studies and latent space visualization
-4. **Two weeks:** Draft introduction and methods sections
+### Completed
+- [x] Implement hybrid detection (latent + frequency features)
+- [x] Validate on overfitting tests (4/4 PASS)
+- [x] Validate on continuous learning (3.8-5.9% improvement)
+- [x] Clean up codebase (57 files removed)
+- [x] Export production model
+- [x] Run latent space visualization (t-SNE, Mahalanobis distributions)
+
+### ACHIEVED: Frequency Drift 0.9+ AUROC
+**Target met with ChirpDetector: 0.9245 AUROC** (was 0.8467 with Hybrid(f=0.5))
+
+**How it was achieved:**
+1. Created `ChirpDetector` class with 12 chirp-specific features:
+   - Quadratic phase fitting (detects parabolic phase = drift)
+   - Instantaneous frequency linearity (R²)
+   - Chirp rate estimation
+   - Spectral centroid drift
+2. Key insight: Frequency drift creates quadratic phase, so quadratic fit quality is discriminative
+3. ChirpDetector works standalone for drift-focused detection, or Hybrid(c=0.5) for balanced performance
+
+**Trade-offs:**
+| Method | frequency_drift | Average (all types) |
+|--------|-----------------|---------------------|
+| ChirpDetector | **0.9245** | 0.8764 (degrades amplitude anomalies) |
+| Hybrid(c=0.5) | 0.8611 | **0.9549** (balanced) |
+
+### Next Priority
+1. Acquire RadioML dataset or similar real RF data
+2. Implement remaining baseline comparisons
+3. Draft introduction and methods sections

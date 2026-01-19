@@ -30,6 +30,7 @@ from src.detection.phase_detector import (
     PhaseAnomalyDetector,
     EnhancedFrequencyDetector,
     AdaptiveHybridDetector,
+    ChirpDetector,
 )
 from src.detection.metrics import compute_metrics
 
@@ -118,6 +119,13 @@ def test_detection_methods(model, train_loader, test_loader, device, anomaly_typ
     metrics = compute_metrics(freq_scores, labels)
     results["Freq-only"] = metrics.auroc
 
+    # 3b. Chirp detector (optimized for frequency drift)
+    chirp_det = ChirpDetector()
+    chirp_det.fit(train_iq)
+    chirp_scores = chirp_det.score(test_iq)
+    metrics = compute_metrics(chirp_scores, labels)
+    results["Chirp-only"] = metrics.auroc
+
     # 4. Basic hybrid (latent + phase)
     def normalize(s):
         return (s - s.min()) / (s.max() - s.min() + 1e-8)
@@ -132,6 +140,12 @@ def test_detection_methods(model, train_loader, test_loader, device, anomaly_typ
         hybrid = (1 - fw) * normalize(latent_scores) + fw * normalize(freq_scores)
         metrics = compute_metrics(hybrid, labels)
         results[f"Hybrid(f={fw})"] = metrics.auroc
+
+    # 5b. Chirp hybrid (latent + chirp)
+    for cw in [0.3, 0.5, 0.7]:
+        hybrid = (1 - cw) * normalize(latent_scores) + cw * normalize(chirp_scores)
+        metrics = compute_metrics(hybrid, labels)
+        results[f"Hybrid(c={cw})"] = metrics.auroc
 
     # 6. Adaptive hybrid (latent + phase + freq)
     adaptive_det = AdaptiveHybridDetector(
@@ -241,7 +255,7 @@ def main():
     print("-"*90)
 
     # Key methods to highlight
-    key_methods = ["Latent-only", "Hybrid(p=0.5)", "Hybrid(f=0.5)", "Adaptive(dynamic)", "Adapt(0.3,0.5,0.2)"]
+    key_methods = ["Latent-only", "Phase-only", "Chirp-only", "Hybrid(p=0.5)", "Hybrid(f=0.5)", "Hybrid(c=0.5)", "Adaptive(dynamic)"]
 
     for method in key_methods:
         if method not in all_methods:

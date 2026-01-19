@@ -1,7 +1,7 @@
 # Claude Session Memory - RF Anomaly Detection Project
 
-**Last Updated:** 2026-01-18 22:00
-**Session Status:** Enhanced hybrid detection implemented and validated
+**Last Updated:** 2026-01-18 23:30
+**Session Status:** ChirpDetector achieved 0.9245 AUROC on frequency drift (target met!)
 
 ---
 
@@ -861,3 +861,162 @@ detection:
 | Average Improvement | - | +5.5% on freq_drift | Validated |
 
 **Note:** The freq hybrid (0.9549) is slightly lower than phase hybrid (0.9626) but is more robust - it doesn't degrade amplitude_spike or burst_noise like the phase-only approach does.
+
+---
+
+## Session 6: Validation & Cleanup (2026-01-18 Night)
+
+### Goals
+1. Validate hybrid detection on overfitting tests and continuous learning
+2. Clean up project files (remove failed experiments)
+3. Export production-ready model
+
+### Cluster Validation Results
+
+#### Job 1988564: Overfitting Validation (Latent vs Hybrid)
+
+| Test | Latent-Only | Hybrid(f=0.5) | Improvement |
+|------|-------------|---------------|-------------|
+| **Seed Stability** | 0.9308 ± 0.0115 | **0.9454 ± 0.0092** | +1.5%, lower variance |
+| **Frequency Drift** | 0.8004 | **0.8329** | +3.3% |
+| **Severity=1.0 (subtle)** | 0.8393 | **0.8934** | +5.4% |
+| **Low SNR (-10 to 10)** | 0.7186 | **0.7735** | +5.5% |
+
+**All 4 tests PASS for both methods.** Hybrid shows consistent improvement across all metrics.
+
+#### Job 1988565: Continuous Learning Comparison
+
+| Method | Latent AUROC | Hybrid AUROC | Improvement |
+|--------|--------------|--------------|-------------|
+| No Adaptation | 0.8363 | **0.8858** | +5.0% |
+| Online Learning | 0.8015 | **0.8395** | +3.8% |
+| Online + EWC | 0.7799 | **0.8390** | +5.9% |
+| Periodic Retraining | 0.6536 | 0.6929 | +3.9% |
+
+**Key Finding:** Hybrid detection improves all continuous learning methods by 3.8-5.9%.
+
+### Project Cleanup
+
+Removed 57 files total:
+
+| Category | Files Removed |
+|----------|---------------|
+| Failed experiments | `train_complex_encoder.py`, `train_phase_aware.py`, `complex_encoder.py` |
+| Obsolete analysis | `analyze_signals.py`, `analyze_frequency_drift.py`, `baseline_comparison.py`, `ensemble_and_tuning.py`, `improve_and_validate.py` |
+| Obsolete SLURM | `train_complex_encoder.sbatch`, `train_phase_aware.sbatch`, `train_arch_revision.sbatch` |
+| Cache files | 41 `.pyc` files, 8 `__pycache__` directories |
+
+**Project now contains only working, essential code.**
+
+### Exported Model
+
+Production-ready model exported to project root:
+
+```
+snr_conditioned_vae_hybrid_v1.pt (21 MB)
+```
+
+| Property | Value |
+|----------|-------|
+| Architecture | SNRConditionedVAE |
+| Latent dim | 32 |
+| Detection | Hybrid (latent + freq, weight=0.5) |
+| Best AUROC | 0.9549 (average), 0.8467 (freq_drift) |
+
+### Current Project Structure (Post-Cleanup)
+
+```
+experiments/     8 Python files (was 17)
+src/models/      5 Python files (was 6)
+cluster/slurm/   6 sbatch files (was 9)
+```
+
+### Next Steps: Frequency Drift Improvement
+
+Current frequency drift AUROC: **0.8467** (target: 0.9+)
+
+**Proposed approaches:**
+1. **Adaptive weighting** - Auto-detect phase instability → increase freq weight
+2. **Specialized drift features** - Chirp rate, phase unwrapping, FM index
+3. **Two-stage detection** - First detect anomaly, then classify type
+4. **Time-frequency input** - Add spectrogram/wavelet to encoder
+
+### Files Modified This Session
+- `experiments/validate_no_overfit.py` - Added `--detection-method` and `--freq-weight` args
+- `experiments/compare_learning.py` - Added hybrid detection support
+- `cluster/slurm/validate_hybrid.sbatch` - New validation job
+- `cluster/slurm/compare_learning_hybrid.sbatch` - New comparison job
+
+### Key Insights
+
+1. **Hybrid detection is validated** - Consistent improvement across all tests
+2. **Better on subtle anomalies** - +5.4% AUROC at severity=1.0
+3. **More stable** - Lower variance across random seeds
+4. **Works with continuous learning** - Improves all adaptation methods
+
+---
+
+## Session 7: ChirpDetector - Frequency Drift Target ACHIEVED
+
+**Date:** 2026-01-18
+**Focus:** Improve frequency drift detection from 0.8467 to 0.9+ AUROC
+
+### Problem Analysis
+
+Initial experiments showed frequency drift detection at ~0.56 AUROC - much lower than expected.
+
+**Root cause:** Using `anomaly_severity=1.0` instead of config's `4.0`. At severity=1.0, the drift effect is too subtle (drift phase ~98 radians over 1024 samples, but modulation IF std ~0.86 dominates).
+
+**With correct severity=4.0:** Latent-only achieves 0.79 AUROC, Phase-only achieves 0.8981 AUROC.
+
+### Solution: ChirpDetector
+
+Created specialized detector exploiting that frequency drift = quadratic phase (chirp signal).
+
+**Key features (12 total):**
+1. **Quadratic fit quality** - Drift signals have lower quad residual
+2. **Linear vs quad improvement** - Ratio shows parabolic phase
+3. **IF slope** - Direct drift rate measurement
+4. **IF R²** - How linear is instantaneous frequency change
+5. Spectral centroid drift, phase variance, FM asymmetry, etc.
+
+### Results: TARGET ACHIEVED
+
+| Method | frequency_drift | Average (all types) |
+|--------|-----------------|---------------------|
+| Latent-only | 0.7909 | 0.9278 |
+| Phase-only | 0.8981 | 0.8749 |
+| **ChirpDetector** | **0.9245** | 0.8764 |
+| Hybrid(f=0.5) | 0.8467 | 0.9549 |
+| Hybrid(c=0.5) | 0.8611 | 0.9549 |
+
+**ChirpDetector achieves 0.9245 AUROC on frequency drift** - exceeding the 0.9 target!
+
+### Trade-offs
+
+ChirpDetector excels at frequency drift but degrades amplitude-based anomalies:
+- amplitude_spike: 1.0 → 0.73 (-27%)
+- burst_noise: 1.0 → 0.84 (-16%)
+
+**Recommendation:** Use ChirpDetector standalone when frequency drift is the primary concern, or Hybrid(c=0.5) for balanced multi-anomaly detection.
+
+### Files Added/Modified
+
+**Added:**
+- `src/detection/phase_detector.py` - Added `ChirpDetector` class
+- `experiments/improve_drift_detection.py` - New experiment script
+- `experiments/debug_drift_features.py` - Feature analysis
+- `experiments/test_spectral_drift.py` - Spectral approach testing
+- `experiments/test_matched_filter_drift.py` - Matched filter testing
+
+**Modified:**
+- `experiments/test_improved_detection.py` - Added ChirpDetector comparisons
+- `RESEARCH_ROADMAP.md` - Updated with achieved target
+- `CLAUDE_MEMORY.md` - This session
+
+### Key Learnings
+
+1. **Severity matters**: anomaly_severity=4.0 makes anomalies 4x stronger, essential for detection
+2. **Phase-domain features work**: Quadratic phase fitting is effective for drift detection
+3. **Matched filtering doesn't work well**: Modulation noise overwhelms chirp correlation
+4. **Detector selection matters**: Different detectors excel at different anomaly types
