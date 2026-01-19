@@ -27,6 +27,7 @@ from src.detection.metrics import compute_metrics
 from src.learning.online import OnlineLearner
 from src.learning.periodic import PeriodicRetrainer, RetrainingTrigger
 from src.learning.ewc import EWCLearner
+from src.learning.ucl import UCLLearner
 from src.learning.replay_buffer import ReplayBuffer
 
 
@@ -278,6 +279,78 @@ def run_periodic_retraining(
     }
 
 
+def run_online_ucl_learning(
+    model: nn.Module,
+    stream_loader: DataLoader,
+    test_loader: DataLoader,
+    config,
+    device: torch.device,
+    eval_interval: int,
+    initial_data_loader: DataLoader,
+) -> dict:
+    """Run online learning with UCL (Uncertainty-based Continual Learning).
+
+    UCL is designed for models with Bayesian layers, where it uses posterior
+    variance to determine weight importance.
+    """
+    logger.info("Running Online Learning with UCL...")
+
+    # Get UCL config with defaults
+    ucl_lambda = config.continuous_learning.get("ucl", {}).get("lambda", 100.0)
+
+    ucl = UCLLearner(
+        model=model,
+        ucl_lambda=ucl_lambda,
+        device=device,
+    )
+
+    # Initialize UCL with initial data (take snapshot after initial training)
+    logger.info("Computing initial importance for UCL...")
+    # Do a forward pass to initialize lazy layers
+    for batch in initial_data_loader:
+        iq = batch["iq"].to(device)
+        snr = batch.get("snr")
+        snr = snr.to(device) if snr is not None else None
+        with torch.no_grad():
+            _ = model(iq, snr) if snr is not None else model(iq)
+        break
+
+    ucl.snapshot()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.continuous_learning.online.learning_rate)
+    is_snr_conditioned, is_vae = get_model_capabilities(model)
+
+    metrics_history = []
+    sample_count = 0
+
+    for batch in tqdm(stream_loader, desc="Online+UCL Learning"):
+        model.train()
+
+        iq = batch["iq"].to(device)
+        snr = batch.get("snr")
+        if snr is not None:
+            snr = snr.to(device)
+
+        optimizer.zero_grad()
+        task_loss = compute_task_loss(model, iq, snr, is_snr_conditioned, is_vae)
+        loss = task_loss + ucl.penalty()
+        loss.backward()
+        optimizer.step()
+
+        sample_count += batch["iq"].size(0)
+
+        if sample_count % eval_interval == 0:
+            eval_metrics = evaluate_model(model, test_loader, device)
+            eval_metrics["sample_count"] = sample_count
+            metrics_history.append(eval_metrics)
+
+    return {
+        "method": "online_ucl",
+        "final_metrics": metrics_history[-1] if metrics_history else {},
+        "history": metrics_history,
+    }
+
+
 def run_no_adaptation(
     model: nn.Module,
     stream_loader: DataLoader,
@@ -384,6 +457,14 @@ def main():
     results["periodic"] = run_periodic_retraining(
         model_periodic, stream_loader, test_loader, config, device, args.eval_interval
     )
+
+    # 5. Online + UCL (if model has Bayesian layers or we want to compare anyway)
+    ucl_enabled = config.continuous_learning.get("ucl", {}).get("enabled", False)
+    if ucl_enabled:
+        model_ucl = load_baseline_model(args.baseline_checkpoint, config, device)
+        results["online_ucl"] = run_online_ucl_learning(
+            model_ucl, stream_loader, test_loader, config, device, args.eval_interval, initial_loader
+        )
 
     # Print summary
     logger.info("\n" + "=" * 60)

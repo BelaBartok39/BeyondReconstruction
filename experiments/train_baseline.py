@@ -33,16 +33,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def get_model_capabilities(model: nn.Module) -> tuple[bool, bool, bool]:
+def get_model_capabilities(model: nn.Module) -> tuple[bool, bool, bool, bool]:
     """Detect model capabilities once.
 
     Returns:
-        Tuple of (is_snr_conditioned, is_vae, uses_power_conditioning).
+        Tuple of (is_snr_conditioned, is_vae, uses_power_conditioning, is_probabilistic).
     """
     is_snr_conditioned = hasattr(model, "encoder") and hasattr(model.encoder, "cond_embed")
     is_vae = hasattr(model, "reparameterize")
     uses_power_conditioning = hasattr(model, "use_power_conditioning") and model.use_power_conditioning
-    return is_snr_conditioned, is_vae, uses_power_conditioning
+    is_probabilistic = hasattr(model, "probabilistic_decoder") and model.probabilistic_decoder
+    return is_snr_conditioned, is_vae, uses_power_conditioning, is_probabilistic
 
 
 def model_forward(
@@ -53,39 +54,61 @@ def model_forward(
     is_snr_conditioned: bool,
     is_vae: bool,
     uses_power_conditioning: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+    is_probabilistic: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
     """Unified forward pass handling all model types.
 
     Returns:
-        Tuple of (x_recon, mu, logvar, latent).
+        Tuple of (x_recon, x_recon_logvar, mu, logvar, latent).
+        x_recon_logvar is None for non-probabilistic models.
     """
     if is_snr_conditioned and snr is not None:
         if uses_power_conditioning and power is not None:
-            return model(iq, snr, power)
-        return model(iq, snr)
-    if is_vae:
-        return model(iq)
-    x_recon, latent = model(iq)
-    return x_recon, None, None, latent
+            out = model(iq, snr, power)
+        else:
+            out = model(iq, snr)
+    elif is_vae:
+        out = model(iq)
+    else:
+        x_recon, latent = model(iq)
+        return x_recon, None, None, None, latent
+
+    # Handle probabilistic decoder output
+    if is_probabilistic:
+        # Output: (x_mean, x_logvar, mu, logvar, z)
+        x_mean, x_logvar, mu, logvar, z = out
+        return x_mean, x_logvar, mu, logvar, z
+    else:
+        # Output: (x_recon, mu, logvar, z)
+        x_recon, mu, logvar, z = out
+        return x_recon, None, mu, logvar, z
 
 
 def compute_loss(
     model: nn.Module,
     iq: torch.Tensor,
     x_recon: torch.Tensor,
+    x_recon_logvar: torch.Tensor | None,
     mu: torch.Tensor | None,
     logvar: torch.Tensor | None,
     is_vae: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    is_probabilistic: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute loss for any model type.
 
     Returns:
-        Tuple of (total_loss, recon_loss, kl_loss).
+        Tuple of (total_loss, recon_loss, kl_loss, smooth_loss).
     """
     if is_vae and mu is not None and logvar is not None:
-        return model.loss(iq, x_recon, mu, logvar)
-    loss = model.reconstruction_loss(iq, x_recon)
-    return loss, loss, torch.tensor(0.0)
+        loss_out = model.loss(iq, x_recon, mu, logvar, x_recon_logvar)
+        if len(loss_out) == 4:
+            # Probabilistic with smoothness: (total, recon, kl, smooth)
+            return loss_out
+        else:
+            # Standard: (total, recon, kl)
+            return loss_out[0], loss_out[1], loss_out[2], torch.tensor(0.0)
+    loss = model.reconstruction_loss(iq, x_recon, x_recon_logvar)
+    return loss, loss, torch.tensor(0.0), torch.tensor(0.0)
 
 
 def compute_contrastive_loss(
@@ -168,9 +191,9 @@ def train_epoch(
         contrastive_weight: Weight for contrastive loss (0 = disabled).
     """
     model.train()
-    is_snr_conditioned, is_vae, uses_power = get_model_capabilities(model)
+    is_snr_conditioned, is_vae, uses_power, is_probabilistic = get_model_capabilities(model)
 
-    total_loss = total_recon = total_kl = total_contrastive = 0.0
+    total_loss = total_recon = total_kl = total_contrastive = total_smooth = 0.0
     num_batches = 0
 
     for batch in tqdm(train_loader, desc="Training", leave=False):
@@ -188,8 +211,12 @@ def train_epoch(
         optimizer.zero_grad()
 
         # Forward and compute loss
-        x_recon, mu, logvar, _ = model_forward(model, iq, snr, power, is_snr_conditioned, is_vae, uses_power)
-        loss, recon_loss, kl_loss = compute_loss(model, iq, x_recon, mu, logvar, is_vae)
+        x_recon, x_recon_logvar, mu, logvar, _ = model_forward(
+            model, iq, snr, power, is_snr_conditioned, is_vae, uses_power, is_probabilistic
+        )
+        loss, recon_loss, kl_loss, smooth_loss = compute_loss(
+            model, iq, x_recon, x_recon_logvar, mu, logvar, is_vae, is_probabilistic
+        )
 
         # Add contrastive loss if semi-supervised
         contrastive_loss = torch.tensor(0.0, device=device)
@@ -206,6 +233,7 @@ def train_epoch(
         total_recon += recon_loss.item()
         total_kl += kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
         total_contrastive += contrastive_loss.item() if isinstance(contrastive_loss, torch.Tensor) else contrastive_loss
+        total_smooth += smooth_loss.item() if isinstance(smooth_loss, torch.Tensor) else smooth_loss
         num_batches += 1
 
     return {
@@ -213,6 +241,7 @@ def train_epoch(
         "recon_loss": total_recon / num_batches,
         "kl_loss": total_kl / num_batches,
         "contrastive_loss": total_contrastive / num_batches,
+        "smooth_loss": total_smooth / num_batches,
     }
 
 
@@ -220,7 +249,7 @@ def train_epoch(
 def validate(model: nn.Module, val_loader: DataLoader, device: torch.device) -> dict[str, float]:
     """Validate model."""
     model.eval()
-    is_snr_conditioned, is_vae, uses_power = get_model_capabilities(model)
+    is_snr_conditioned, is_vae, uses_power, is_probabilistic = get_model_capabilities(model)
 
     total_loss = 0.0
 
@@ -233,18 +262,38 @@ def validate(model: nn.Module, val_loader: DataLoader, device: torch.device) -> 
         if power is not None:
             power = power.to(device)
 
-        x_recon, mu, logvar, _ = model_forward(model, iq, snr, power, is_snr_conditioned, is_vae, uses_power)
-        loss, _, _ = compute_loss(model, iq, x_recon, mu, logvar, is_vae)
+        x_recon, x_recon_logvar, mu, logvar, _ = model_forward(
+            model, iq, snr, power, is_snr_conditioned, is_vae, uses_power, is_probabilistic
+        )
+        loss, _, _, _ = compute_loss(model, iq, x_recon, x_recon_logvar, mu, logvar, is_vae, is_probabilistic)
         total_loss += loss.item()
 
     return {"val_loss": total_loss / len(val_loader)}
 
 
-def evaluate_detection(model: nn.Module, test_loader: DataLoader, device: torch.device, config) -> dict[str, float]:
-    """Evaluate anomaly detection performance."""
+def evaluate_detection(
+    model: nn.Module,
+    train_loader: DataLoader,
+    test_loader: DataLoader,
+    device: torch.device,
+    config
+) -> dict[str, float]:
+    """Evaluate anomaly detection performance.
+
+    Args:
+        model: Trained model.
+        train_loader: Training data loader (for fitting detector on normal data).
+        test_loader: Test data loader (for evaluating detection).
+        device: Device to run inference on.
+        config: Configuration object.
+
+    Returns:
+        Dictionary of detection metrics.
+    """
     # Get config values with defaults for backwards compatibility
     invert_scores = config.detection.get("invert_scores", False)
     hybrid_weights = tuple(config.detection.get("hybrid_weights", [0.5, 0.5]))
+    scoring_method = config.detection.get("scoring_method", "auto")
 
     detector = AnomalyDetector(
         model=model,
@@ -256,8 +305,10 @@ def evaluate_detection(model: nn.Module, test_loader: DataLoader, device: torch.
         invert_scores=invert_scores,
         hybrid_weights=hybrid_weights,
         device=device,
+        scoring_method=scoring_method,
     )
-    detector.fit(test_loader, num_batches=50)
+    # Fit on training data (assumed normal) to learn threshold and latent statistics
+    detector.fit(train_loader, num_batches=50)
     scores, predictions, labels = detector.detect_batch(test_loader)
 
     if labels is None:
@@ -271,6 +322,7 @@ def evaluate_detection(model: nn.Module, test_loader: DataLoader, device: torch.
         "precision": metrics.precision,
         "recall": metrics.recall,
         "threshold": metrics.threshold,
+        "scoring_method": scoring_method,
     }
 
 
@@ -425,11 +477,14 @@ def main():
 
     # Evaluate detection performance
     logger.info("Evaluating detection performance...")
-    detection_metrics = evaluate_detection(model, test_loader, device, config)
+    detection_metrics = evaluate_detection(model, train_loader, test_loader, device, config)
 
     logger.info("Detection Results:")
     for key, value in detection_metrics.items():
-        logger.info(f"  {key}: {value:.4f}")
+        if isinstance(value, (int, float)):
+            logger.info(f"  {key}: {value:.4f}")
+        else:
+            logger.info(f"  {key}: {value}")
 
     # Save final results
     results = {

@@ -30,6 +30,11 @@ class AnomalyDetector:
     - latent: Mahalanobis distance in latent space
     - hybrid: Combination of both methods
 
+    Supports multiple scoring methods:
+    - mse: Mean squared error (traditional)
+    - nll: Gaussian negative log-likelihood (for probabilistic decoders)
+    - auto: Automatically selects NLL if model has probabilistic decoder
+
     Example:
         detector = AnomalyDetector(model, method="hybrid")
         detector.fit(train_loader)  # Learn threshold from training data
@@ -49,6 +54,10 @@ class AnomalyDetector:
         invert_scores: bool = False,
         hybrid_weights: tuple[float, float] = (0.5, 0.5),
         device: torch.device | str | None = None,
+        scoring_method: Literal["mse", "nll", "auto"] = "auto",
+        use_epistemic: bool = False,
+        epistemic_weight: float = 1.0,
+        epistemic_samples: int = 10,
     ):
         """Initialize anomaly detector.
 
@@ -64,6 +73,10 @@ class AnomalyDetector:
             invert_scores: If True, invert scores (use when anomalies have lower scores).
             hybrid_weights: Weights for (reconstruction, latent) in hybrid mode.
             device: Device to run inference on.
+            scoring_method: Reconstruction scoring method ("mse", "nll", or "auto").
+            use_epistemic: Whether to include epistemic uncertainty in scoring.
+            epistemic_weight: Weight for epistemic uncertainty term.
+            epistemic_samples: Number of samples for epistemic uncertainty estimation.
         """
         self.model = model
         self.method = method
@@ -75,6 +88,10 @@ class AnomalyDetector:
         self.snr_range = snr_range
         self.invert_scores = invert_scores
         self.hybrid_weights = hybrid_weights
+        self.scoring_method = scoring_method
+        self.use_epistemic = use_epistemic
+        self.epistemic_weight = epistemic_weight
+        self.epistemic_samples = epistemic_samples
         self.device = (
             next(model.parameters()).device if device is None
             else torch.device(device) if isinstance(device, str)
@@ -94,6 +111,8 @@ class AnomalyDetector:
         self._is_snr_conditioned = hasattr(model, "encoder") and hasattr(model.encoder, "cond_embed")
         self._is_vae = hasattr(model, "reparameterize")
         self._uses_power = hasattr(model, "use_power_conditioning") and model.use_power_conditioning
+        self._is_probabilistic = hasattr(model, "probabilistic_decoder") and model.probabilistic_decoder
+        self._has_bayesian_encoder = hasattr(model, "encoder") and hasattr(model.encoder, "get_epistemic_uncertainty")
 
     def fit(
         self,
@@ -228,6 +247,9 @@ class AnomalyDetector:
     def _reconstruction_score(self, iq: Tensor, snr: Tensor | None = None, power: Tensor | None = None) -> Tensor:
         """Compute reconstruction-based anomaly score.
 
+        Supports both MSE and NLL (Gaussian negative log-likelihood) scoring.
+        NLL scoring uses the decoder's learned variance to weight reconstruction errors.
+
         Args:
             iq: IQ signals.
             snr: Normalized SNR values.
@@ -236,18 +258,42 @@ class AnomalyDetector:
         Returns:
             Reconstruction error per sample.
         """
+        # Determine scoring method
+        use_nll = self.scoring_method == "nll" or (
+            self.scoring_method == "auto" and self._is_probabilistic
+        )
+
         # Get reconstruction based on model type
         if self._is_snr_conditioned and snr is not None:
             if self._uses_power and power is not None:
-                x_recon = self.model(iq, snr, power)[0]
+                model_out = self.model(iq, snr, power)
             else:
-                x_recon = self.model(iq, snr)[0]
+                model_out = self.model(iq, snr)
         elif self._is_vae:
-            x_recon = self.model(iq)[0]
+            model_out = self.model(iq)
         else:
-            x_recon = self.model(iq)[0]
+            model_out = self.model(iq)
 
-        return ((iq - x_recon) ** 2).mean(dim=(1, 2))
+        # Handle probabilistic vs deterministic output
+        if use_nll and self._is_probabilistic:
+            # Probabilistic decoder: output is (x_mean, x_logvar, mu, logvar, z)
+            x_mean, x_logvar = model_out[0], model_out[1]
+            # Gaussian NLL: 0.5 * (logvar + (x - mean)^2 / exp(logvar))
+            var = torch.exp(x_logvar)
+            scores = 0.5 * (x_logvar + (iq - x_mean).pow(2) / var).mean(dim=(1, 2))
+        else:
+            # Deterministic decoder: output is (x_recon, mu, logvar, z)
+            x_recon = model_out[0]
+            scores = ((iq - x_recon) ** 2).mean(dim=(1, 2))
+
+        # Add epistemic uncertainty if enabled and model supports it
+        if self.use_epistemic and self._has_bayesian_encoder:
+            epistemic = self.model.encoder.get_epistemic_uncertainty(
+                iq, snr, power, num_samples=self.epistemic_samples
+            )
+            scores = scores + self.epistemic_weight * epistemic.mean(dim=-1)
+
+        return scores
 
     def _latent_score(self, iq: Tensor, snr: Tensor | None = None, power: Tensor | None = None) -> Tensor:
         """Compute latent-space anomaly score (Mahalanobis distance).
@@ -401,6 +447,10 @@ class AnomalyDetector:
             "is_fitted": self._is_fitted,
             "score_mean": self._score_mean,
             "score_std": self._score_std,
+            "scoring_method": self.scoring_method,
+            "is_probabilistic": self._is_probabilistic,
+            "use_epistemic": self.use_epistemic,
+            "epistemic_weight": self.epistemic_weight if self.use_epistemic else None,
         }
 
         if self._snr_thresholds is not None:

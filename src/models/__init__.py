@@ -3,5 +3,6 @@
 from .autoencoder import ConvAutoencoder
 from .vae import ConvVAE
 from .snr_encoder import SNRConditionedVAE
+from .bayesian import BayesianLinear, BayesianEncoder
 
-__all__ = ["ConvAutoencoder", "ConvVAE", "SNRConditionedVAE"]
+__all__ = ["ConvAutoencoder", "ConvVAE", "SNRConditionedVAE", "BayesianLinear", "BayesianEncoder"]

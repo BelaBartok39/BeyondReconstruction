@@ -49,7 +49,10 @@ def _combine_conditioning(snr: Tensor, power: Tensor | None = None) -> Tensor:
 
 
 class SNREncoder(nn.Module):
-    """VAE encoder with SNR and optional power conditioning."""
+    """VAE encoder with SNR and optional power conditioning.
+
+    Optionally supports Bayesian last layers for epistemic uncertainty estimation.
+    """
 
     def __init__(
         self,
@@ -61,12 +64,16 @@ class SNREncoder(nn.Module):
         use_batch_norm: bool = True,
         dropout: float = 0.1,
         use_power_conditioning: bool = False,
+        use_bayesian: bool = False,
+        bll_prior_std: float = 1.0,
     ):
         super().__init__()
         self.hidden_channels = hidden_channels or [32, 64, 128, 256]
         self.latent_dim = latent_dim
         self.snr_embedding_dim = snr_embedding_dim
         self.use_power_conditioning = use_power_conditioning
+        self.use_bayesian = use_bayesian
+        self.bll_prior_std = bll_prior_std
 
         # Conditioning input dimension: 1 for SNR only, 2 for SNR+power
         cond_input_dim = 2 if use_power_conditioning else 1
@@ -86,25 +93,104 @@ class SNREncoder(nn.Module):
         # Projection layers (lazy initialization)
         self._mu_proj = None
         self._logvar_proj = None
+        self._bayesian_proj = None  # For Bayesian last layer
+        self._combined_size = None
 
-    def forward(self, x: Tensor, snr: Tensor, power: Tensor | None = None) -> tuple[Tensor, Tensor]:
-        """Encode input with SNR and optional power conditioning."""
+    def _init_projections(self, combined_size: int, device: torch.device) -> None:
+        """Initialize projection layers (lazy initialization)."""
+        self._combined_size = combined_size
+
+        if self.use_bayesian:
+            from .bayesian import BayesianEncoder
+            self._bayesian_proj = BayesianEncoder(
+                combined_size=combined_size,
+                latent_dim=self.latent_dim,
+                prior_std=self.bll_prior_std,
+            ).to(device)
+        else:
+            self._mu_proj = nn.Linear(combined_size, self.latent_dim).to(device)
+            self._logvar_proj = nn.Linear(combined_size, self.latent_dim).to(device)
+
+    def forward(
+        self, x: Tensor, snr: Tensor, power: Tensor | None = None, sample: bool = True
+    ) -> tuple[Tensor, Tensor]:
+        """Encode input with SNR and optional power conditioning.
+
+        Args:
+            x: Input signal [batch, channels, seq_len].
+            snr: Normalized SNR values [batch].
+            power: Optional normalized power values [batch].
+            sample: If True and using Bayesian layers, sample weights.
+
+        Returns:
+            Tuple of (mu, logvar) for the latent distribution.
+        """
         cond = _combine_conditioning(snr, power if self.use_power_conditioning else None)
         cond_emb = self.cond_embed(cond)
         h = self.conv_layers(x).flatten(1)
         h_combined = torch.cat([h, cond_emb], dim=1)
 
         # Lazy initialization
-        if self._mu_proj is None:
-            combined_size = h_combined.size(1)
-            self._mu_proj = nn.Linear(combined_size, self.latent_dim).to(x.device)
-            self._logvar_proj = nn.Linear(combined_size, self.latent_dim).to(x.device)
+        if self._mu_proj is None and self._bayesian_proj is None:
+            self._init_projections(h_combined.size(1), x.device)
 
+        if self.use_bayesian:
+            return self._bayesian_proj(h_combined, sample=sample)
         return self._mu_proj(h_combined), self._logvar_proj(h_combined)
+
+    def get_epistemic_uncertainty(
+        self,
+        x: Tensor,
+        snr: Tensor,
+        power: Tensor | None = None,
+        num_samples: int = 10,
+    ) -> Tensor:
+        """Estimate epistemic uncertainty via Monte Carlo sampling.
+
+        Only available when use_bayesian=True.
+
+        Args:
+            x: Input signal [batch, channels, seq_len].
+            snr: Normalized SNR values [batch].
+            power: Optional normalized power values [batch].
+            num_samples: Number of MC samples for uncertainty estimation.
+
+        Returns:
+            Epistemic uncertainty [batch, latent_dim].
+        """
+        if not self.use_bayesian:
+            # Return zeros for non-Bayesian encoders
+            batch_size = x.size(0)
+            return torch.zeros(batch_size, self.latent_dim, device=x.device)
+
+        cond = _combine_conditioning(snr, power if self.use_power_conditioning else None)
+        cond_emb = self.cond_embed(cond)
+        h = self.conv_layers(x).flatten(1)
+        h_combined = torch.cat([h, cond_emb], dim=1)
+
+        # Lazy initialization if needed
+        if self._bayesian_proj is None:
+            self._init_projections(h_combined.size(1), x.device)
+
+        return self._bayesian_proj.get_epistemic_uncertainty(h_combined, num_samples)
+
+    def kl_divergence(self) -> Tensor:
+        """Get KL divergence for Bayesian layers (for regularization).
+
+        Returns:
+            KL divergence scalar, or 0 if not using Bayesian layers.
+        """
+        if self.use_bayesian and self._bayesian_proj is not None:
+            return self._bayesian_proj.kl_divergence()
+        return torch.tensor(0.0)
 
 
 class SNRDecoder(nn.Module):
-    """VAE decoder with SNR and optional power conditioning."""
+    """VAE decoder with SNR and optional power conditioning.
+
+    Supports probabilistic decoding where the decoder outputs both
+    mean and log-variance for reconstruction uncertainty estimation.
+    """
 
     def __init__(
         self,
@@ -117,11 +203,13 @@ class SNRDecoder(nn.Module):
         use_batch_norm: bool = True,
         dropout: float = 0.1,
         use_power_conditioning: bool = False,
+        probabilistic: bool = False,
     ):
         super().__init__()
         self.hidden_channels = hidden_channels or [256, 128, 64, 32]
         self.output_length = output_length
         self.use_power_conditioning = use_power_conditioning
+        self.probabilistic = probabilistic
 
         # Conditioning input dimension: 1 for SNR only, 2 for SNR+power
         cond_input_dim = 2 if use_power_conditioning else 1
@@ -149,28 +237,61 @@ class SNRDecoder(nn.Module):
             for i in range(len(channels) - 1)
         ])
 
-        # Final layer
-        self.final_conv = nn.ConvTranspose1d(
+        # Final layer for mean
+        self.final_mean = nn.ConvTranspose1d(
             channels[-1], out_channels, kernel_size, stride=2,
             padding=kernel_size // 2, output_padding=1
         )
 
-    def forward(self, z: Tensor, snr: Tensor, power: Tensor | None = None) -> Tensor:
-        """Decode latent sample with SNR and optional power conditioning."""
+        # Final layer for log-variance (only if probabilistic)
+        if probabilistic:
+            self.final_logvar = nn.ConvTranspose1d(
+                channels[-1], out_channels, kernel_size, stride=2,
+                padding=kernel_size // 2, output_padding=1
+            )
+            # Initialize logvar to small values for numerical stability
+            nn.init.constant_(self.final_logvar.weight, 0.0)
+            nn.init.constant_(self.final_logvar.bias, -3.0)  # exp(-3) ≈ 0.05 std
+
+    def forward(self, z: Tensor, snr: Tensor, power: Tensor | None = None) -> Tensor | tuple[Tensor, Tensor]:
+        """Decode latent sample with SNR and optional power conditioning.
+
+        Args:
+            z: Latent representation [batch, latent_dim].
+            snr: Normalized SNR values [batch].
+            power: Optional normalized power values [batch].
+
+        Returns:
+            If probabilistic=False: x_recon [batch, channels, seq_len]
+            If probabilistic=True: (x_mean, x_logvar) tuple
+        """
         cond = _combine_conditioning(snr, power if self.use_power_conditioning else None)
         cond_emb = self.cond_embed(cond)
         z_combined = torch.cat([z, cond_emb], dim=1)
         h = self.latent_proj(z_combined).view(-1, self._init_channels, self._init_length)
         h = self.conv_layers(h)
-        x_recon = self.final_conv(h)
 
-        # Ensure output length matches
-        if x_recon.size(2) != self.output_length:
-            x_recon = nn.functional.interpolate(
-                x_recon, size=self.output_length, mode="linear", align_corners=False
+        # Compute mean
+        x_mean = self.final_mean(h)
+        if x_mean.size(2) != self.output_length:
+            x_mean = nn.functional.interpolate(
+                x_mean, size=self.output_length, mode="linear", align_corners=False
             )
 
-        return x_recon
+        if not self.probabilistic:
+            return x_mean
+
+        # Compute log-variance for probabilistic decoding
+        x_logvar = self.final_logvar(h)
+        if x_logvar.size(2) != self.output_length:
+            x_logvar = nn.functional.interpolate(
+                x_logvar, size=self.output_length, mode="linear", align_corners=False
+            )
+
+        # Clamp logvar for numerical stability
+        x_logvar = torch.clamp(x_logvar, min=-10.0, max=2.0)
+
+        return x_mean, x_logvar
 
 
 class SNRConditionedVAE(nn.Module):
@@ -182,6 +303,9 @@ class SNRConditionedVAE(nn.Module):
     - Tolerate higher reconstruction error in low-SNR conditions
     - Be more sensitive to anomalies in high-SNR signals
     - Distinguish anomalies by their unusual power characteristics
+
+    When probabilistic=True, the decoder outputs both mean and variance,
+    enabling Gaussian NLL loss and reconstruction probability scoring.
 
     Example:
         model = SNRConditionedVAE(latent_dim=32, sequence_length=1024, use_power_conditioning=True)
@@ -202,6 +326,11 @@ class SNRConditionedVAE(nn.Module):
         dropout: float = 0.1,
         beta: float = 1.0,
         use_power_conditioning: bool = False,
+        probabilistic_decoder: bool = False,
+        smoothness_lambda: float = 0.0,
+        use_bayesian_encoder: bool = False,
+        bll_prior_std: float = 1.0,
+        bll_kl_weight: float = 1e-4,
     ):
         super().__init__()
         hidden_channels = hidden_channels or [32, 64, 128, 256]
@@ -209,6 +338,10 @@ class SNRConditionedVAE(nn.Module):
         self.sequence_length = sequence_length
         self.beta = beta
         self.use_power_conditioning = use_power_conditioning
+        self.probabilistic_decoder = probabilistic_decoder
+        self.smoothness_lambda = smoothness_lambda
+        self.use_bayesian_encoder = use_bayesian_encoder
+        self.bll_kl_weight = bll_kl_weight
 
         self.encoder = SNREncoder(
             in_channels=2,
@@ -219,6 +352,8 @@ class SNRConditionedVAE(nn.Module):
             use_batch_norm=use_batch_norm,
             dropout=dropout,
             use_power_conditioning=use_power_conditioning,
+            use_bayesian=use_bayesian_encoder,
+            bll_prior_std=bll_prior_std,
         )
 
         self.decoder = SNRDecoder(
@@ -231,6 +366,7 @@ class SNRConditionedVAE(nn.Module):
             use_batch_norm=use_batch_norm,
             dropout=dropout,
             use_power_conditioning=use_power_conditioning,
+            probabilistic=probabilistic_decoder,
         )
 
     def reparameterize(self, mu: Tensor, logvar: Tensor) -> Tensor:
@@ -241,39 +377,140 @@ class SNRConditionedVAE(nn.Module):
 
     def forward(
         self, x: Tensor, snr: Tensor, power: Tensor | None = None
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Forward pass with SNR and optional power conditioning."""
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Forward pass with SNR and optional power conditioning.
+
+        Returns:
+            If probabilistic_decoder=False:
+                (x_recon, mu, logvar, z)
+            If probabilistic_decoder=True:
+                (x_recon_mean, x_recon_logvar, mu, logvar, z)
+        """
         mu, logvar = self.encoder(x, snr, power)
         z = self.reparameterize(mu, logvar)
-        return self.decoder(z, snr, power), mu, logvar, z
+        decoder_out = self.decoder(z, snr, power)
+
+        if self.probabilistic_decoder:
+            x_mean, x_logvar = decoder_out
+            return x_mean, x_logvar, mu, logvar, z
+        return decoder_out, mu, logvar, z
 
     def encode(self, x: Tensor, snr: Tensor, power: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """Encode with SNR and optional power conditioning."""
         return self.encoder(x, snr, power)
 
-    def decode(self, z: Tensor, snr: Tensor, power: Tensor | None = None) -> Tensor:
+    def decode(self, z: Tensor, snr: Tensor, power: Tensor | None = None) -> Tensor | tuple[Tensor, Tensor]:
         """Decode with SNR and optional power conditioning."""
         return self.decoder(z, snr, power)
 
-    def reconstruction_loss(self, x: Tensor, x_recon: Tensor) -> Tensor:
-        """Compute reconstruction loss."""
-        return nn.functional.mse_loss(x_recon, x, reduction="mean")
+    def reconstruction_loss(
+        self, x: Tensor, x_recon: Tensor, x_logvar: Tensor | None = None
+    ) -> Tensor:
+        """Compute reconstruction loss.
+
+        Args:
+            x: Original input [batch, channels, seq_len].
+            x_recon: Reconstruction mean [batch, channels, seq_len].
+            x_logvar: Reconstruction log-variance (optional, for NLL loss).
+
+        Returns:
+            Reconstruction loss (MSE or Gaussian NLL).
+        """
+        if x_logvar is None:
+            # Standard MSE loss
+            return nn.functional.mse_loss(x_recon, x, reduction="mean")
+
+        # Gaussian negative log-likelihood
+        # NLL = 0.5 * (logvar + (x - mean)^2 / exp(logvar))
+        var = torch.exp(x_logvar)
+        nll = 0.5 * (x_logvar + (x - x_recon).pow(2) / var)
+        return nll.mean()
+
+    def smoothness_loss(self, x_mean: Tensor, x_logvar: Tensor) -> Tensor:
+        """Compute smoothness prior loss (KL between adjacent time steps).
+
+        Penalizes rapid changes in the reconstruction distribution to prevent
+        overfitting to point anomalies like spikes and bursts.
+
+        Args:
+            x_mean: Reconstruction mean [batch, channels, seq_len].
+            x_logvar: Reconstruction log-variance [batch, channels, seq_len].
+
+        Returns:
+            Smoothness loss (KL divergence between adjacent distributions).
+        """
+        if self.smoothness_lambda == 0.0:
+            return torch.tensor(0.0, device=x_mean.device)
+
+        # KL(N(μ_t, σ_t²) || N(μ_{t-1}, σ_{t-1}²)) between adjacent time steps
+        mu_curr = x_mean[:, :, 1:]
+        mu_prev = x_mean[:, :, :-1]
+        logvar_curr = x_logvar[:, :, 1:]
+        logvar_prev = x_logvar[:, :, :-1]
+
+        var_curr = torch.exp(logvar_curr)
+        var_prev = torch.exp(logvar_prev)
+
+        # KL divergence: 0.5 * (var_ratio + mu_diff²/var_prev - 1 - log(var_ratio))
+        var_ratio = var_curr / var_prev
+        mu_diff_sq = (mu_curr - mu_prev).pow(2)
+        kl = 0.5 * (var_ratio + mu_diff_sq / var_prev - 1 - torch.log(var_ratio))
+
+        return kl.mean()
 
     def kl_divergence(self, mu: Tensor, logvar: Tensor) -> Tensor:
         """Compute KL divergence from standard normal."""
         from .vae import _compute_kl_divergence
         return _compute_kl_divergence(mu, logvar, reduce=True)
 
-    def loss(self, x: Tensor, x_recon: Tensor, mu: Tensor, logvar: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Compute total VAE loss."""
-        recon_loss = self.reconstruction_loss(x, x_recon)
+    def loss(
+        self,
+        x: Tensor,
+        x_recon: Tensor,
+        mu: Tensor,
+        logvar: Tensor,
+        x_recon_logvar: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Compute total VAE loss.
+
+        Args:
+            x: Original input.
+            x_recon: Reconstruction mean.
+            mu: Latent mean.
+            logvar: Latent log-variance.
+            x_recon_logvar: Reconstruction log-variance (for probabilistic decoder).
+
+        Returns:
+            If not probabilistic: (total_loss, recon_loss, kl_loss)
+            If probabilistic: (total_loss, recon_loss, kl_loss, smoothness_loss)
+        """
+        recon_loss = self.reconstruction_loss(x, x_recon, x_recon_logvar)
         kl_loss = self.kl_divergence(mu, logvar)
-        return recon_loss + self.beta * kl_loss, recon_loss, kl_loss
+        total_loss = recon_loss + self.beta * kl_loss
+
+        # Add Bayesian encoder KL divergence if using BLL
+        if self.use_bayesian_encoder:
+            bll_kl = self.encoder.kl_divergence()
+            total_loss = total_loss + self.bll_kl_weight * bll_kl
+
+        if x_recon_logvar is not None and self.smoothness_lambda > 0:
+            smooth_loss = self.smoothness_loss(x_recon, x_recon_logvar)
+            total_loss = total_loss + self.smoothness_lambda * smooth_loss
+            return total_loss, recon_loss, kl_loss, smooth_loss
+
+        return total_loss, recon_loss, kl_loss
 
     def get_reconstruction_error(self, x: Tensor, snr: Tensor, power: Tensor | None = None) -> Tensor:
         """Get per-sample reconstruction error."""
-        x_recon, _, _, _ = self(x, snr, power)
-        return ((x - x_recon) ** 2).mean(dim=(1, 2))
+        if self.probabilistic_decoder:
+            x_mean, x_logvar, _, _, _ = self(x, snr, power)
+            # Return NLL as reconstruction error
+            var = torch.exp(x_logvar)
+            nll = 0.5 * (x_logvar + (x - x_mean).pow(2) / var)
+            return nll.mean(dim=(1, 2))
+        else:
+            x_recon, _, _, _ = self(x, snr, power)
+            return ((x - x_recon) ** 2).mean(dim=(1, 2))
 
     def get_anomaly_score(
         self,
@@ -282,15 +519,36 @@ class SNRConditionedVAE(nn.Module):
         power: Tensor | None = None,
         include_kl: bool = True,
         num_samples: int = 1,
+        scoring_method: str = "auto",
     ) -> Tensor:
-        """Compute anomaly score with SNR and optional power conditioning."""
+        """Compute anomaly score with SNR and optional power conditioning.
+
+        Args:
+            x: Input signals [batch, 2, seq_len].
+            snr: Normalized SNR values [batch].
+            power: Optional normalized power values [batch].
+            include_kl: Whether to include KL term in score.
+            num_samples: Number of Monte Carlo samples.
+            scoring_method: "mse", "nll", or "auto" (uses NLL if probabilistic).
+
+        Returns:
+            Anomaly scores [batch].
+        """
         mu, logvar = self.encoder(x, snr, power)
+        use_nll = scoring_method == "nll" or (scoring_method == "auto" and self.probabilistic_decoder)
 
         # Compute reconstruction error with optional Monte Carlo sampling
         if num_samples == 1:
             z = self.reparameterize(mu, logvar)
-            x_recon = self.decoder(z, snr, power)
-            recon_error = ((x - x_recon) ** 2).mean(dim=(1, 2))
+            decoder_out = self.decoder(z, snr, power)
+
+            if use_nll and self.probabilistic_decoder:
+                x_mean, x_logvar = decoder_out
+                var = torch.exp(x_logvar)
+                recon_error = 0.5 * (x_logvar + (x - x_mean).pow(2) / var).mean(dim=(1, 2))
+            else:
+                x_recon = decoder_out if not self.probabilistic_decoder else decoder_out[0]
+                recon_error = ((x - x_recon) ** 2).mean(dim=(1, 2))
         else:
             # Vectorized Monte Carlo estimate
             batch_size = x.size(0)
@@ -303,11 +561,19 @@ class SNRConditionedVAE(nn.Module):
 
             if power is not None:
                 power_expanded = _normalize_conditioning(power).unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, 1)
-                x_recon = self.decoder(z, snr_expanded.squeeze(1), power_expanded.squeeze(1))
+                decoder_out = self.decoder(z, snr_expanded.squeeze(1), power_expanded.squeeze(1))
             else:
-                x_recon = self.decoder(z, snr_expanded.squeeze(1), None)
+                decoder_out = self.decoder(z, snr_expanded.squeeze(1), None)
 
-            recon_error = ((x_expanded - x_recon) ** 2).mean(dim=(1, 2)).view(batch_size, num_samples).mean(dim=1)
+            if use_nll and self.probabilistic_decoder:
+                x_mean, x_logvar = decoder_out
+                var = torch.exp(x_logvar)
+                recon_error = 0.5 * (x_logvar + (x_expanded - x_mean).pow(2) / var).mean(dim=(1, 2))
+            else:
+                x_recon = decoder_out if not self.probabilistic_decoder else decoder_out[0]
+                recon_error = ((x_expanded - x_recon) ** 2).mean(dim=(1, 2))
+
+            recon_error = recon_error.view(batch_size, num_samples).mean(dim=1)
 
         if include_kl:
             from .vae import _compute_kl_divergence
@@ -338,11 +604,21 @@ def create_model(config) -> nn.Module:
 
     if model_type == "snr_vae":
         use_power = getattr(config.model, 'use_power_conditioning', False)
+        probabilistic = getattr(config.model, 'probabilistic_decoder', False)
+        smoothness_lambda = getattr(config.model, 'smoothness_lambda', 0.0)
+        use_bayesian = getattr(config.model, 'use_bayesian_encoder', False)
+        bll_prior_std = getattr(config.model, 'bll_prior_std', 1.0)
+        bll_kl_weight = getattr(config.model, 'bll_kl_weight', 1e-4)
         return SNRConditionedVAE(
             **common_args,
             snr_embedding_dim=config.model.snr_embedding_dim,
             beta=config.model.beta,
             use_power_conditioning=use_power,
+            probabilistic_decoder=probabilistic,
+            smoothness_lambda=smoothness_lambda,
+            use_bayesian_encoder=use_bayesian,
+            bll_prior_std=bll_prior_std,
+            bll_kl_weight=bll_kl_weight,
         )
 
     raise ValueError(f"Unknown model type: {model_type}")
