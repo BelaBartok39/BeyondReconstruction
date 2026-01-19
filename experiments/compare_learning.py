@@ -142,11 +142,39 @@ def load_baseline_model(checkpoint_path: str, config, device: torch.device) -> n
     return model
 
 
-def evaluate_model(model: nn.Module, test_loader: DataLoader, device: torch.device) -> dict[str, float]:
-    """Evaluate model on test set."""
-    model.eval()
-    is_snr_conditioned, is_vae = get_model_capabilities(model)
+def evaluate_model(
+    model: nn.Module,
+    test_loader: DataLoader,
+    device: torch.device,
+    fit_loader: DataLoader | None = None,
+) -> dict[str, float]:
+    """Evaluate model on test set using latent-only detection.
 
+    Args:
+        model: The model to evaluate.
+        test_loader: DataLoader with test data (including anomalies).
+        device: Device to run on.
+        fit_loader: DataLoader with normal-only data for fitting detector.
+                   If None, uses test_loader (less accurate).
+    """
+    model.eval()
+
+    # Create detector with latent-only method (best performing)
+    detector = AnomalyDetector(
+        model=model,
+        method="latent",
+        threshold_method="percentile",
+        threshold_percentile=95,
+        snr_adaptive=True,
+        snr_bins=7,
+        device=device,
+    )
+
+    # Fit detector on normal data
+    loader_for_fit = fit_loader if fit_loader is not None else test_loader
+    detector.fit(loader_for_fit, num_batches=50)
+
+    # Score test data using detector's detect method
     all_scores, all_labels = [], []
 
     with torch.no_grad():
@@ -155,14 +183,14 @@ def evaluate_model(model: nn.Module, test_loader: DataLoader, device: torch.devi
             snr = batch.get("snr")
             if snr is not None:
                 snr = snr.to(device)
+            snr_db = batch.get("snr_db")
             power = batch.get("power")
             if power is not None:
                 power = power.to(device)
 
-            x_recon = model_forward(model, iq, snr, power, is_snr_conditioned, is_vae)
-            error = ((iq - x_recon) ** 2).mean(dim=(1, 2))
-
-            all_scores.append(error.cpu())
+            # Use detector's detect method for latent-only scoring
+            result = detector.detect(iq, snr, snr_db, power)
+            all_scores.append(torch.from_numpy(result.scores))
             all_labels.append(batch["label"])
 
     scores = torch.cat(all_scores).numpy()
@@ -184,6 +212,7 @@ def run_online_learning(
     config,
     device: torch.device,
     eval_interval: int,
+    fit_loader: DataLoader,
 ) -> dict:
     """Run online learning experiment."""
     logger.info("Running Online Learning...")
@@ -205,7 +234,7 @@ def run_online_learning(
 
         # Periodic evaluation
         if sample_count % eval_interval == 0:
-            eval_metrics = evaluate_model(model, test_loader, device)
+            eval_metrics = evaluate_model(model, test_loader, device, fit_loader)
             eval_metrics["sample_count"] = sample_count
             metrics_history.append(eval_metrics)
 
@@ -262,7 +291,7 @@ def run_online_ewc_learning(
         sample_count += batch["iq"].size(0)
 
         if sample_count % eval_interval == 0:
-            eval_metrics = evaluate_model(model, test_loader, device)
+            eval_metrics = evaluate_model(model, test_loader, device, initial_data_loader)
             eval_metrics["sample_count"] = sample_count
             metrics_history.append(eval_metrics)
 
@@ -280,6 +309,7 @@ def run_periodic_retraining(
     config,
     device: torch.device,
     eval_interval: int,
+    fit_loader: DataLoader,
 ) -> dict:
     """Run periodic retraining experiment."""
     logger.info("Running Periodic Retraining...")
@@ -302,10 +332,10 @@ def run_periodic_retraining(
         sample_count += batch["iq"].size(0)
 
         if retrainer.should_retrain():
-            retrainer.retrain(validation_fn=lambda m: evaluate_model(m, test_loader, device))
+            retrainer.retrain(validation_fn=lambda m: evaluate_model(m, test_loader, device, fit_loader))
 
         if sample_count % eval_interval == 0:
-            eval_metrics = evaluate_model(model, test_loader, device)
+            eval_metrics = evaluate_model(model, test_loader, device, fit_loader)
             eval_metrics["sample_count"] = sample_count
             metrics_history.append(eval_metrics)
 
@@ -381,7 +411,7 @@ def run_online_ucl_learning(
         sample_count += batch["iq"].size(0)
 
         if sample_count % eval_interval == 0:
-            eval_metrics = evaluate_model(model, test_loader, device)
+            eval_metrics = evaluate_model(model, test_loader, device, initial_data_loader)
             eval_metrics["sample_count"] = sample_count
             metrics_history.append(eval_metrics)
 
@@ -398,6 +428,7 @@ def run_no_adaptation(
     test_loader: DataLoader,
     device: torch.device,
     eval_interval: int,
+    fit_loader: DataLoader,
 ) -> dict:
     """Run baseline without any adaptation (for comparison)."""
     logger.info("Running No Adaptation Baseline...")
@@ -410,7 +441,7 @@ def run_no_adaptation(
 
         # Periodic evaluation (no updates)
         if sample_count % eval_interval == 0:
-            eval_metrics = evaluate_model(model, test_loader, device)
+            eval_metrics = evaluate_model(model, test_loader, device, fit_loader)
             eval_metrics["sample_count"] = sample_count
             metrics_history.append(eval_metrics)
 
@@ -478,13 +509,13 @@ def main():
     # 1. No adaptation baseline
     model_no_adapt = load_baseline_model(args.baseline_checkpoint, config, device)
     results["no_adaptation"] = run_no_adaptation(
-        model_no_adapt, stream_loader, test_loader, device, args.eval_interval
+        model_no_adapt, stream_loader, test_loader, device, args.eval_interval, initial_loader
     )
 
     # 2. Online learning
     model_online = load_baseline_model(args.baseline_checkpoint, config, device)
     results["online"] = run_online_learning(
-        model_online, stream_loader, test_loader, config, device, args.eval_interval
+        model_online, stream_loader, test_loader, config, device, args.eval_interval, initial_loader
     )
 
     # 3. Online + EWC
@@ -496,7 +527,7 @@ def main():
     # 4. Periodic retraining
     model_periodic = load_baseline_model(args.baseline_checkpoint, config, device)
     results["periodic"] = run_periodic_retraining(
-        model_periodic, stream_loader, test_loader, config, device, args.eval_interval
+        model_periodic, stream_loader, test_loader, config, device, args.eval_interval, initial_loader
     )
 
     # 5. Online + UCL (if model has Bayesian layers or we want to compare anyway)
