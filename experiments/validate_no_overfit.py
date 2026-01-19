@@ -5,10 +5,13 @@ Tests:
 1. Different random seeds - results should be consistent
 2. Held-out anomaly types - model should generalize
 3. Different SNR ranges - robustness check
+
+Supports both latent-only and hybrid detection methods.
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -23,7 +26,25 @@ from src.data.synthetic import SyntheticRFGenerator
 from src.data.datasets import RFDataset
 from src.models.snr_encoder import create_model
 from src.detection.detector import AnomalyDetector
+from src.detection.phase_detector import EnhancedFrequencyDetector
 from src.detection.metrics import compute_metrics
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Validate model for overfitting")
+    parser.add_argument(
+        "--detection-method",
+        choices=["latent", "hybrid"],
+        default="latent",
+        help="Detection method: latent (Mahalanobis) or hybrid (latent + freq features)",
+    )
+    parser.add_argument(
+        "--freq-weight",
+        type=float,
+        default=0.5,
+        help="Weight for frequency features in hybrid mode (default: 0.5)",
+    )
+    return parser.parse_args()
 
 
 def get_device() -> torch.device:
@@ -49,8 +70,17 @@ def load_model(checkpoint_path: str, config, device: torch.device):
     return model
 
 
-def evaluate_auroc(model, train_loader, test_loader, device):
-    """Evaluate AUROC using latent-only detection."""
+def evaluate_auroc(model, train_loader, test_loader, device, detection_method="latent", freq_weight=0.5):
+    """Evaluate AUROC using specified detection method.
+
+    Args:
+        model: The trained model
+        train_loader: DataLoader with normal training data for fitting
+        test_loader: DataLoader with test data (including anomalies)
+        device: torch device
+        detection_method: "latent" or "hybrid"
+        freq_weight: Weight for frequency features in hybrid mode
+    """
     detector = AnomalyDetector(
         model=model,
         method="latent",
@@ -62,7 +92,16 @@ def evaluate_auroc(model, train_loader, test_loader, device):
     )
     detector.fit(train_loader, num_batches=50)
 
+    # For hybrid detection, also fit the frequency detector
+    freq_detector = None
+    if detection_method == "hybrid":
+        train_iq = np.concatenate([b["iq"].numpy() for b in train_loader])
+        freq_detector = EnhancedFrequencyDetector()
+        freq_detector.fit(train_iq)
+
     all_scores, all_labels = [], []
+    all_iq_for_freq = [] if detection_method == "hybrid" else None
+
     with torch.no_grad():
         for batch in test_loader:
             iq = batch["iq"].to(device)
@@ -78,13 +117,30 @@ def evaluate_auroc(model, train_loader, test_loader, device):
             all_scores.append(result.scores)
             all_labels.append(batch["label"].numpy())
 
-    scores = np.concatenate(all_scores)
+            if detection_method == "hybrid":
+                all_iq_for_freq.append(batch["iq"].numpy())
+
+    latent_scores = np.concatenate(all_scores)
     labels = np.concatenate(all_labels)
+
+    # Combine scores for hybrid detection
+    if detection_method == "hybrid":
+        test_iq = np.concatenate(all_iq_for_freq)
+        freq_scores = freq_detector.score(test_iq)
+
+        # Normalize both scores to [0, 1]
+        def normalize(s):
+            return (s - s.min()) / (s.max() - s.min() + 1e-8)
+
+        scores = (1 - freq_weight) * normalize(latent_scores) + freq_weight * normalize(freq_scores)
+    else:
+        scores = latent_scores
+
     metrics = compute_metrics(scores, labels)
     return metrics.auroc, metrics.auprc
 
 
-def test_different_seeds(model, config, device, seeds=[42, 123, 456, 789, 2024]):
+def test_different_seeds(model, config, device, detection_method="latent", freq_weight=0.5, seeds=[42, 123, 456, 789, 2024]):
     """Test model on data generated with different random seeds."""
     print("\n" + "="*60)
     print("TEST 1: Different Random Seeds")
@@ -118,7 +174,7 @@ def test_different_seeds(model, config, device, seeds=[42, 123, 456, 789, 2024])
         )
         test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
-        auroc, auprc = evaluate_auroc(model, train_loader, test_loader, device)
+        auroc, auprc = evaluate_auroc(model, train_loader, test_loader, device, detection_method, freq_weight)
         results.append((seed, auroc, auprc))
         print(f"  Seed {seed}: AUROC={auroc:.4f}, AUPRC={auprc:.4f}")
 
@@ -129,7 +185,7 @@ def test_different_seeds(model, config, device, seeds=[42, 123, 456, 789, 2024])
     return results
 
 
-def test_held_out_anomalies(model, config, device):
+def test_held_out_anomalies(model, config, device, detection_method="latent", freq_weight=0.5):
     """Test on anomaly types not seen during training."""
     print("\n" + "="*60)
     print("TEST 2: Held-Out Anomaly Types")
@@ -165,7 +221,7 @@ def test_held_out_anomalies(model, config, device):
         )
         test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
-        auroc, auprc = evaluate_auroc(model, train_loader, test_loader, device)
+        auroc, auprc = evaluate_auroc(model, train_loader, test_loader, device, detection_method, freq_weight)
         in_training = anomaly_type in config.data.anomaly_types
         marker = "✓" if in_training else "✗ (held-out)"
         results.append((anomaly_type, auroc, in_training))
