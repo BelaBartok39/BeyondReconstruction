@@ -294,6 +294,54 @@ class SNRDecoder(nn.Module):
         return x_mean, x_logvar
 
 
+def _compute_phase_features(x: Tensor, eps: float = 1e-8) -> tuple[Tensor, Tensor, Tensor]:
+    """Compute phase-based features from I/Q signal.
+
+    Args:
+        x: I/Q signal [batch, 2, seq_len] where x[:,0,:] is I and x[:,1,:] is Q.
+        eps: Small value for numerical stability with near-zero amplitudes.
+
+    Returns:
+        Tuple of (phase, inst_freq, phase_variance):
+        - phase: Unwrapped phase [batch, seq_len]
+        - inst_freq: Instantaneous frequency (normalized to [-1, 1]) [batch, seq_len-1]
+        - phase_variance: Per-sample phase variance [batch]
+    """
+    # Convert to complex signal
+    complex_signal = torch.complex(x[:, 0, :], x[:, 1, :])
+
+    # Compute amplitude for masking near-zero regions
+    amplitude = torch.abs(complex_signal)
+
+    # Compute phase (angle) - stable for near-zero amplitudes
+    phase = torch.atan2(x[:, 1, :], x[:, 0, :] + eps)
+
+    # Unwrap phase (approximate - PyTorch doesn't have unwrap)
+    # Use diff to detect wraps and correct them
+    phase_diff = phase[:, 1:] - phase[:, :-1]
+    # Wrap diff to [-pi, pi]
+    phase_diff = torch.remainder(phase_diff + torch.pi, 2 * torch.pi) - torch.pi
+
+    # Cumsum to get unwrapped phase (starting from first value)
+    phase_unwrapped = torch.cat([
+        phase[:, :1],
+        phase[:, :1] + torch.cumsum(phase_diff, dim=1)
+    ], dim=1)
+
+    # Instantaneous frequency (phase derivative), normalized to [-1, 1]
+    # Original is in [-pi, pi], divide by pi to normalize
+    inst_freq = phase_diff / torch.pi
+
+    # Mask out near-zero amplitude regions where phase is unreliable
+    amp_mask = (amplitude[:, :-1] > 0.01).float()
+    inst_freq = inst_freq * amp_mask
+
+    # Phase variance per sample
+    phase_variance = torch.var(phase_unwrapped, dim=1)
+
+    return phase_unwrapped, inst_freq, phase_variance
+
+
 class SNRConditionedVAE(nn.Module):
     """SNR and Power-Conditioned Variational Autoencoder.
 
@@ -306,6 +354,9 @@ class SNRConditionedVAE(nn.Module):
 
     When probabilistic=True, the decoder outputs both mean and variance,
     enabling Gaussian NLL loss and reconstruction probability scoring.
+
+    Phase-aware mode adds loss terms for phase and instantaneous frequency
+    reconstruction, improving detection of frequency drift anomalies.
 
     Example:
         model = SNRConditionedVAE(latent_dim=32, sequence_length=1024, use_power_conditioning=True)
@@ -331,6 +382,8 @@ class SNRConditionedVAE(nn.Module):
         use_bayesian_encoder: bool = False,
         bll_prior_std: float = 1.0,
         bll_kl_weight: float = 1e-4,
+        phase_loss_weight: float = 0.0,
+        inst_freq_loss_weight: float = 0.0,
     ):
         super().__init__()
         hidden_channels = hidden_channels or [32, 64, 128, 256]
@@ -342,6 +395,8 @@ class SNRConditionedVAE(nn.Module):
         self.smoothness_lambda = smoothness_lambda
         self.use_bayesian_encoder = use_bayesian_encoder
         self.bll_kl_weight = bll_kl_weight
+        self.phase_loss_weight = phase_loss_weight
+        self.inst_freq_loss_weight = inst_freq_loss_weight
 
         self.encoder = SNREncoder(
             in_channels=2,
@@ -458,6 +513,37 @@ class SNRConditionedVAE(nn.Module):
 
         return kl.mean()
 
+    def phase_loss(self, x: Tensor, x_recon: Tensor) -> tuple[Tensor, Tensor]:
+        """Compute phase-sensitive loss terms.
+
+        Forces the latent space to capture phase information by penalizing
+        phase reconstruction error and instantaneous frequency error.
+
+        Args:
+            x: Original I/Q signal [batch, 2, seq_len].
+            x_recon: Reconstructed I/Q signal [batch, 2, seq_len].
+
+        Returns:
+            Tuple of (phase_loss, inst_freq_loss).
+        """
+        if self.phase_loss_weight == 0.0 and self.inst_freq_loss_weight == 0.0:
+            device = x.device
+            return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+
+        # Compute phase features for original and reconstruction
+        phase_orig, inst_freq_orig, _ = _compute_phase_features(x)
+        phase_recon, inst_freq_recon, _ = _compute_phase_features(x_recon)
+
+        # Phase loss: circular distance (accounts for wrap-around)
+        # Use cosine similarity for phase comparison
+        phase_diff = phase_orig - phase_recon
+        phase_cos_loss = 1.0 - torch.cos(phase_diff).mean()
+
+        # Instantaneous frequency loss: MSE on frequency
+        inst_freq_mse = nn.functional.mse_loss(inst_freq_recon, inst_freq_orig)
+
+        return phase_cos_loss, inst_freq_mse
+
     def kl_divergence(self, mu: Tensor, logvar: Tensor) -> Tensor:
         """Compute KL divergence from standard normal."""
         from .vae import _compute_kl_divergence
@@ -470,7 +556,7 @@ class SNRConditionedVAE(nn.Module):
         mu: Tensor,
         logvar: Tensor,
         x_recon_logvar: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, ...]:
         """Compute total VAE loss.
 
         Args:
@@ -481,8 +567,10 @@ class SNRConditionedVAE(nn.Module):
             x_recon_logvar: Reconstruction log-variance (for probabilistic decoder).
 
         Returns:
-            If not probabilistic: (total_loss, recon_loss, kl_loss)
-            If probabilistic: (total_loss, recon_loss, kl_loss, smoothness_loss)
+            Tuple containing (total_loss, recon_loss, kl_loss) plus optional:
+            - smoothness_loss (if smoothness_lambda > 0)
+            - phase_loss (if phase_loss_weight > 0)
+            - inst_freq_loss (if inst_freq_loss_weight > 0)
         """
         recon_loss = self.reconstruction_loss(x, x_recon, x_recon_logvar)
         kl_loss = self.kl_divergence(mu, logvar)
@@ -493,11 +581,24 @@ class SNRConditionedVAE(nn.Module):
             bll_kl = self.encoder.kl_divergence()
             total_loss = total_loss + self.bll_kl_weight * bll_kl
 
+        # Track additional losses
+        extra_losses = []
+
+        # Smoothness loss
         if x_recon_logvar is not None and self.smoothness_lambda > 0:
             smooth_loss = self.smoothness_loss(x_recon, x_recon_logvar)
             total_loss = total_loss + self.smoothness_lambda * smooth_loss
-            return total_loss, recon_loss, kl_loss, smooth_loss
+            extra_losses.append(smooth_loss)
 
+        # Phase-aware losses
+        if self.phase_loss_weight > 0 or self.inst_freq_loss_weight > 0:
+            phase_l, inst_freq_l = self.phase_loss(x, x_recon)
+            total_loss = total_loss + self.phase_loss_weight * phase_l
+            total_loss = total_loss + self.inst_freq_loss_weight * inst_freq_l
+            extra_losses.extend([phase_l, inst_freq_l])
+
+        if extra_losses:
+            return (total_loss, recon_loss, kl_loss, *extra_losses)
         return total_loss, recon_loss, kl_loss
 
     def get_reconstruction_error(self, x: Tensor, snr: Tensor, power: Tensor | None = None) -> Tensor:
@@ -609,6 +710,8 @@ def create_model(config) -> nn.Module:
         use_bayesian = getattr(config.model, 'use_bayesian_encoder', False)
         bll_prior_std = getattr(config.model, 'bll_prior_std', 1.0)
         bll_kl_weight = getattr(config.model, 'bll_kl_weight', 1e-4)
+        phase_loss_weight = getattr(config.model, 'phase_loss_weight', 0.0)
+        inst_freq_loss_weight = getattr(config.model, 'inst_freq_loss_weight', 0.0)
         return SNRConditionedVAE(
             **common_args,
             snr_embedding_dim=config.model.snr_embedding_dim,
@@ -619,6 +722,8 @@ def create_model(config) -> nn.Module:
             use_bayesian_encoder=use_bayesian,
             bll_prior_std=bll_prior_std,
             bll_kl_weight=bll_kl_weight,
+            phase_loss_weight=phase_loss_weight,
+            inst_freq_loss_weight=inst_freq_loss_weight,
         )
 
     raise ValueError(f"Unknown model type: {model_type}")
