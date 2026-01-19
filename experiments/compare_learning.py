@@ -11,6 +11,7 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -29,6 +30,7 @@ from src.learning.periodic import PeriodicRetrainer, RetrainingTrigger
 from src.learning.ewc import EWCLearner
 from src.learning.ucl import UCLLearner
 from src.learning.replay_buffer import ReplayBuffer
+from src.detection.phase_detector import EnhancedFrequencyDetector
 
 
 logging.basicConfig(
@@ -112,6 +114,18 @@ def parse_args():
     parser.add_argument("--num-streaming-samples", type=int, default=10000, help="Number of streaming samples")
     parser.add_argument("--eval-interval", type=int, default=500, help="Evaluation interval in samples")
     parser.add_argument("--concept-drift", action="store_true", help="Enable concept drift in streaming data")
+    parser.add_argument(
+        "--detection-method",
+        choices=["latent", "hybrid"],
+        default="latent",
+        help="Detection method: latent (Mahalanobis) or hybrid (latent + freq features)",
+    )
+    parser.add_argument(
+        "--freq-weight",
+        type=float,
+        default=0.5,
+        help="Weight for frequency features in hybrid mode (default: 0.5)",
+    )
     return parser.parse_args()
 
 
@@ -147,8 +161,10 @@ def evaluate_model(
     test_loader: DataLoader,
     device: torch.device,
     fit_loader: DataLoader | None = None,
+    detection_method: str = "latent",
+    freq_weight: float = 0.5,
 ) -> dict[str, float]:
-    """Evaluate model on test set using latent-only detection.
+    """Evaluate model on test set using specified detection method.
 
     Args:
         model: The model to evaluate.
@@ -156,6 +172,8 @@ def evaluate_model(
         device: Device to run on.
         fit_loader: DataLoader with normal-only data for fitting detector.
                    If None, uses test_loader (less accurate).
+        detection_method: "latent" or "hybrid"
+        freq_weight: Weight for frequency features in hybrid mode
     """
     model.eval()
 
@@ -174,8 +192,16 @@ def evaluate_model(
     loader_for_fit = fit_loader if fit_loader is not None else test_loader
     detector.fit(loader_for_fit, num_batches=50)
 
+    # For hybrid detection, also fit the frequency detector
+    freq_detector = None
+    if detection_method == "hybrid":
+        train_iq = np.concatenate([b["iq"].numpy() for b in loader_for_fit])
+        freq_detector = EnhancedFrequencyDetector()
+        freq_detector.fit(train_iq)
+
     # Score test data using detector's detect method
     all_scores, all_labels = [], []
+    all_iq_for_freq = [] if detection_method == "hybrid" else None
 
     with torch.no_grad():
         for batch in test_loader:
@@ -193,8 +219,25 @@ def evaluate_model(
             all_scores.append(torch.from_numpy(result.scores))
             all_labels.append(batch["label"])
 
-    scores = torch.cat(all_scores).numpy()
+            if detection_method == "hybrid":
+                all_iq_for_freq.append(batch["iq"].numpy())
+
+    latent_scores = torch.cat(all_scores).numpy()
     labels = torch.cat(all_labels).numpy()
+
+    # Combine scores for hybrid detection
+    if detection_method == "hybrid":
+        test_iq = np.concatenate(all_iq_for_freq)
+        freq_scores = freq_detector.score(test_iq)
+
+        # Normalize both scores to [0, 1]
+        def normalize(s):
+            return (s - s.min()) / (s.max() - s.min() + 1e-8)
+
+        scores = (1 - freq_weight) * normalize(latent_scores) + freq_weight * normalize(freq_scores)
+    else:
+        scores = latent_scores
+
     metrics = compute_metrics(scores, labels)
 
     return {
@@ -213,6 +256,8 @@ def run_online_learning(
     device: torch.device,
     eval_interval: int,
     fit_loader: DataLoader,
+    detection_method: str = "latent",
+    freq_weight: float = 0.5,
 ) -> dict:
     """Run online learning experiment."""
     logger.info("Running Online Learning...")
@@ -234,7 +279,7 @@ def run_online_learning(
 
         # Periodic evaluation
         if sample_count % eval_interval == 0:
-            eval_metrics = evaluate_model(model, test_loader, device, fit_loader)
+            eval_metrics = evaluate_model(model, test_loader, device, fit_loader, detection_method, freq_weight)
             eval_metrics["sample_count"] = sample_count
             metrics_history.append(eval_metrics)
 
@@ -253,6 +298,8 @@ def run_online_ewc_learning(
     device: torch.device,
     eval_interval: int,
     initial_data_loader: DataLoader,
+    detection_method: str = "latent",
+    freq_weight: float = 0.5,
 ) -> dict:
     """Run online learning with EWC."""
     logger.info("Running Online Learning with EWC...")
@@ -291,7 +338,7 @@ def run_online_ewc_learning(
         sample_count += batch["iq"].size(0)
 
         if sample_count % eval_interval == 0:
-            eval_metrics = evaluate_model(model, test_loader, device, initial_data_loader)
+            eval_metrics = evaluate_model(model, test_loader, device, initial_data_loader, detection_method, freq_weight)
             eval_metrics["sample_count"] = sample_count
             metrics_history.append(eval_metrics)
 
@@ -310,6 +357,8 @@ def run_periodic_retraining(
     device: torch.device,
     eval_interval: int,
     fit_loader: DataLoader,
+    detection_method: str = "latent",
+    freq_weight: float = 0.5,
 ) -> dict:
     """Run periodic retraining experiment."""
     logger.info("Running Periodic Retraining...")
@@ -332,10 +381,10 @@ def run_periodic_retraining(
         sample_count += batch["iq"].size(0)
 
         if retrainer.should_retrain():
-            retrainer.retrain(validation_fn=lambda m: evaluate_model(m, test_loader, device, fit_loader))
+            retrainer.retrain(validation_fn=lambda m: evaluate_model(m, test_loader, device, fit_loader, detection_method, freq_weight))
 
         if sample_count % eval_interval == 0:
-            eval_metrics = evaluate_model(model, test_loader, device, fit_loader)
+            eval_metrics = evaluate_model(model, test_loader, device, fit_loader, detection_method, freq_weight)
             eval_metrics["sample_count"] = sample_count
             metrics_history.append(eval_metrics)
 
@@ -355,6 +404,8 @@ def run_online_ucl_learning(
     device: torch.device,
     eval_interval: int,
     initial_data_loader: DataLoader,
+    detection_method: str = "latent",
+    freq_weight: float = 0.5,
 ) -> dict:
     """Run online learning with UCL (Uncertainty-based Continual Learning).
 
@@ -411,7 +462,7 @@ def run_online_ucl_learning(
         sample_count += batch["iq"].size(0)
 
         if sample_count % eval_interval == 0:
-            eval_metrics = evaluate_model(model, test_loader, device, initial_data_loader)
+            eval_metrics = evaluate_model(model, test_loader, device, initial_data_loader, detection_method, freq_weight)
             eval_metrics["sample_count"] = sample_count
             metrics_history.append(eval_metrics)
 
@@ -429,6 +480,8 @@ def run_no_adaptation(
     device: torch.device,
     eval_interval: int,
     fit_loader: DataLoader,
+    detection_method: str = "latent",
+    freq_weight: float = 0.5,
 ) -> dict:
     """Run baseline without any adaptation (for comparison)."""
     logger.info("Running No Adaptation Baseline...")
@@ -441,7 +494,7 @@ def run_no_adaptation(
 
         # Periodic evaluation (no updates)
         if sample_count % eval_interval == 0:
-            eval_metrics = evaluate_model(model, test_loader, device, fit_loader)
+            eval_metrics = evaluate_model(model, test_loader, device, fit_loader, detection_method, freq_weight)
             eval_metrics["sample_count"] = sample_count
             metrics_history.append(eval_metrics)
 
@@ -505,29 +558,37 @@ def main():
 
     # Run experiments
     results = {}
+    detection_method = args.detection_method
+    freq_weight = args.freq_weight
+
+    logger.info(f"Detection method: {detection_method}" + (f" (freq_weight={freq_weight})" if detection_method == "hybrid" else ""))
 
     # 1. No adaptation baseline
     model_no_adapt = load_baseline_model(args.baseline_checkpoint, config, device)
     results["no_adaptation"] = run_no_adaptation(
-        model_no_adapt, stream_loader, test_loader, device, args.eval_interval, initial_loader
+        model_no_adapt, stream_loader, test_loader, device, args.eval_interval, initial_loader,
+        detection_method, freq_weight
     )
 
     # 2. Online learning
     model_online = load_baseline_model(args.baseline_checkpoint, config, device)
     results["online"] = run_online_learning(
-        model_online, stream_loader, test_loader, config, device, args.eval_interval, initial_loader
+        model_online, stream_loader, test_loader, config, device, args.eval_interval, initial_loader,
+        detection_method, freq_weight
     )
 
     # 3. Online + EWC
     model_ewc = load_baseline_model(args.baseline_checkpoint, config, device)
     results["online_ewc"] = run_online_ewc_learning(
-        model_ewc, stream_loader, test_loader, config, device, args.eval_interval, initial_loader
+        model_ewc, stream_loader, test_loader, config, device, args.eval_interval, initial_loader,
+        detection_method, freq_weight
     )
 
     # 4. Periodic retraining
     model_periodic = load_baseline_model(args.baseline_checkpoint, config, device)
     results["periodic"] = run_periodic_retraining(
-        model_periodic, stream_loader, test_loader, config, device, args.eval_interval, initial_loader
+        model_periodic, stream_loader, test_loader, config, device, args.eval_interval, initial_loader,
+        detection_method, freq_weight
     )
 
     # 5. Online + UCL (if model has Bayesian layers or we want to compare anyway)
@@ -535,7 +596,8 @@ def main():
     if ucl_enabled:
         model_ucl = load_baseline_model(args.baseline_checkpoint, config, device)
         results["online_ucl"] = run_online_ucl_learning(
-            model_ucl, stream_loader, test_loader, config, device, args.eval_interval, initial_loader
+            model_ucl, stream_loader, test_loader, config, device, args.eval_interval, initial_loader,
+            detection_method, freq_weight
         )
 
     # Print summary

@@ -238,7 +238,7 @@ def test_held_out_anomalies(model, config, device, detection_method="latent", fr
     return results
 
 
-def test_different_snr_ranges(model, config, device):
+def test_different_snr_ranges(model, config, device, detection_method="latent", freq_weight=0.5):
     """Test on different SNR ranges to check robustness."""
     print("\n" + "="*60)
     print("TEST 3: Different SNR Ranges")
@@ -278,7 +278,7 @@ def test_different_snr_ranges(model, config, device):
         )
         test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
-        auroc, auprc = evaluate_auroc(model, train_loader, test_loader, device)
+        auroc, auprc = evaluate_auroc(model, train_loader, test_loader, device, detection_method, freq_weight)
         is_original = snr_range == tuple(config.data.snr_range)
         marker = "← training range" if is_original else ""
         results.append((snr_range, auroc))
@@ -287,7 +287,7 @@ def test_different_snr_ranges(model, config, device):
     return results
 
 
-def test_severity_sensitivity(model, config, device):
+def test_severity_sensitivity(model, config, device, detection_method="latent", freq_weight=0.5):
     """Test how AUROC changes with anomaly severity."""
     print("\n" + "="*60)
     print("TEST 4: Anomaly Severity Sensitivity")
@@ -321,7 +321,7 @@ def test_severity_sensitivity(model, config, device):
         )
         test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
-        auroc, auprc = evaluate_auroc(model, train_loader, test_loader, device)
+        auroc, auprc = evaluate_auroc(model, train_loader, test_loader, device, detection_method, freq_weight)
         is_training = severity == config.data.anomaly_severity
         marker = "← training severity" if is_training else ""
         results.append((severity, auroc))
@@ -331,6 +331,7 @@ def test_severity_sensitivity(model, config, device):
 
 
 def main():
+    args = parse_args()
     config = load_config("configs/default.yaml")
     device = get_device()
     print(f"Using device: {device}")
@@ -343,15 +344,16 @@ def main():
     print("OVERFITTING VALIDATION TESTS")
     print("="*60)
     print(f"Model: {checkpoint_path}")
+    print(f"Detection method: {args.detection_method}" + (f" (freq_weight={args.freq_weight})" if args.detection_method == "hybrid" else ""))
     print(f"Training anomaly types: {config.data.anomaly_types}")
     print(f"Training SNR range: {config.data.snr_range}")
     print(f"Training severity: {config.data.anomaly_severity}")
 
     # Run all tests
-    seed_results = test_different_seeds(model, config, device)
-    anomaly_results = test_held_out_anomalies(model, config, device)
-    snr_results = test_different_snr_ranges(model, config, device)
-    severity_results = test_severity_sensitivity(model, config, device)
+    seed_results = test_different_seeds(model, config, device, args.detection_method, args.freq_weight)
+    anomaly_results = test_held_out_anomalies(model, config, device, args.detection_method, args.freq_weight)
+    snr_results = test_different_snr_ranges(model, config, device, args.detection_method, args.freq_weight)
+    severity_results = test_severity_sensitivity(model, config, device, args.detection_method, args.freq_weight)
 
     # Summary
     print("\n" + "="*60)
