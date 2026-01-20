@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from .autoencoder import ConvBlock, ConvTransposeBlock
@@ -46,6 +47,28 @@ def _combine_conditioning(snr: Tensor, power: Tensor | None = None) -> Tensor:
         return snr
     power = _normalize_conditioning(power)
     return torch.cat([snr, power], dim=1)
+
+
+def _gaussian_nll(x: Tensor, mean: Tensor, logvar: Tensor) -> Tensor:
+    """Compute Gaussian negative log-likelihood.
+
+    Args:
+        x: Target values.
+        mean: Predicted mean.
+        logvar: Predicted log-variance.
+
+    Returns:
+        NLL value: 0.5 * (logvar + (x - mean)^2 / exp(logvar))
+    """
+    var = torch.exp(logvar)
+    return 0.5 * (logvar + (x - mean).pow(2) / var)
+
+
+def _interpolate_to_length(tensor: Tensor, target_length: int) -> Tensor:
+    """Interpolate tensor to target sequence length if needed."""
+    if tensor.size(2) == target_length:
+        return tensor
+    return F.interpolate(tensor, size=target_length, mode="linear", align_corners=False)
 
 
 class SNREncoder(nn.Module):
@@ -272,21 +295,13 @@ class SNRDecoder(nn.Module):
         h = self.conv_layers(h)
 
         # Compute mean
-        x_mean = self.final_mean(h)
-        if x_mean.size(2) != self.output_length:
-            x_mean = nn.functional.interpolate(
-                x_mean, size=self.output_length, mode="linear", align_corners=False
-            )
+        x_mean = _interpolate_to_length(self.final_mean(h), self.output_length)
 
         if not self.probabilistic:
             return x_mean
 
         # Compute log-variance for probabilistic decoding
-        x_logvar = self.final_logvar(h)
-        if x_logvar.size(2) != self.output_length:
-            x_logvar = nn.functional.interpolate(
-                x_logvar, size=self.output_length, mode="linear", align_corners=False
-            )
+        x_logvar = _interpolate_to_length(self.final_logvar(h), self.output_length)
 
         # Clamp logvar for numerical stability
         x_logvar = torch.clamp(x_logvar, min=-10.0, max=2.0)
@@ -472,14 +487,8 @@ class SNRConditionedVAE(nn.Module):
             Reconstruction loss (MSE or Gaussian NLL).
         """
         if x_logvar is None:
-            # Standard MSE loss
-            return nn.functional.mse_loss(x_recon, x, reduction="mean")
-
-        # Gaussian negative log-likelihood
-        # NLL = 0.5 * (logvar + (x - mean)^2 / exp(logvar))
-        var = torch.exp(x_logvar)
-        nll = 0.5 * (x_logvar + (x - x_recon).pow(2) / var)
-        return nll.mean()
+            return F.mse_loss(x_recon, x, reduction="mean")
+        return _gaussian_nll(x, x_recon, x_logvar).mean()
 
     def smoothness_loss(self, x_mean: Tensor, x_logvar: Tensor) -> Tensor:
         """Compute smoothness prior loss (KL between adjacent time steps).
@@ -540,7 +549,7 @@ class SNRConditionedVAE(nn.Module):
         phase_cos_loss = 1.0 - torch.cos(phase_diff).mean()
 
         # Instantaneous frequency loss: MSE on frequency
-        inst_freq_mse = nn.functional.mse_loss(inst_freq_recon, inst_freq_orig)
+        inst_freq_mse = F.mse_loss(inst_freq_recon, inst_freq_orig)
 
         return phase_cos_loss, inst_freq_mse
 
@@ -605,13 +614,24 @@ class SNRConditionedVAE(nn.Module):
         """Get per-sample reconstruction error."""
         if self.probabilistic_decoder:
             x_mean, x_logvar, _, _, _ = self(x, snr, power)
-            # Return NLL as reconstruction error
-            var = torch.exp(x_logvar)
-            nll = 0.5 * (x_logvar + (x - x_mean).pow(2) / var)
-            return nll.mean(dim=(1, 2))
-        else:
-            x_recon, _, _, _ = self(x, snr, power)
-            return ((x - x_recon) ** 2).mean(dim=(1, 2))
+            return _gaussian_nll(x, x_mean, x_logvar).mean(dim=(1, 2))
+        x_recon, _, _, _ = self(x, snr, power)
+        return ((x - x_recon) ** 2).mean(dim=(1, 2))
+
+    def _compute_recon_error(
+        self, x: Tensor, decoder_out: Tensor | tuple[Tensor, Tensor], use_nll: bool
+    ) -> Tensor:
+        """Compute per-sample reconstruction error from decoder output."""
+        if use_nll and self.probabilistic_decoder:
+            x_mean, x_logvar = decoder_out
+            return _gaussian_nll(x, x_mean, x_logvar).mean(dim=(1, 2))
+        x_recon = decoder_out if not self.probabilistic_decoder else decoder_out[0]
+        return ((x - x_recon) ** 2).mean(dim=(1, 2))
+
+    def _expand_for_mc(self, tensor: Tensor, num_samples: int) -> Tensor:
+        """Expand tensor for Monte Carlo sampling: [batch, ...] -> [batch*num_samples, ...]."""
+        expanded = tensor.unsqueeze(1).expand(-1, num_samples, *[-1] * (tensor.dim() - 1))
+        return expanded.reshape(-1, *tensor.shape[1:])
 
     def get_anomaly_score(
         self,
@@ -638,48 +658,34 @@ class SNRConditionedVAE(nn.Module):
         mu, logvar = self.encoder(x, snr, power)
         use_nll = scoring_method == "nll" or (scoring_method == "auto" and self.probabilistic_decoder)
 
-        # Compute reconstruction error with optional Monte Carlo sampling
         if num_samples == 1:
             z = self.reparameterize(mu, logvar)
             decoder_out = self.decoder(z, snr, power)
-
-            if use_nll and self.probabilistic_decoder:
-                x_mean, x_logvar = decoder_out
-                var = torch.exp(x_logvar)
-                recon_error = 0.5 * (x_logvar + (x - x_mean).pow(2) / var).mean(dim=(1, 2))
-            else:
-                x_recon = decoder_out if not self.probabilistic_decoder else decoder_out[0]
-                recon_error = ((x - x_recon) ** 2).mean(dim=(1, 2))
+            recon_error = self._compute_recon_error(x, decoder_out, use_nll)
         else:
             # Vectorized Monte Carlo estimate
             batch_size = x.size(0)
-            mu_expanded = mu.unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, mu.size(1))
-            logvar_expanded = logvar.unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, logvar.size(1))
-            z = self.reparameterize(mu_expanded, logvar_expanded)
+            z = self.reparameterize(
+                self._expand_for_mc(mu, num_samples),
+                self._expand_for_mc(logvar, num_samples),
+            )
+            snr_exp = self._expand_for_mc(_normalize_conditioning(snr), num_samples).squeeze(1)
+            x_exp = self._expand_for_mc(x, num_samples)
+            power_exp = self._expand_for_mc(_normalize_conditioning(power), num_samples).squeeze(1) if power is not None else None
 
-            snr_expanded = _normalize_conditioning(snr).unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, 1)
-            x_expanded = x.unsqueeze(1).expand(-1, num_samples, -1, -1).reshape(-1, x.size(1), x.size(2))
-
-            if power is not None:
-                power_expanded = _normalize_conditioning(power).unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, 1)
-                decoder_out = self.decoder(z, snr_expanded.squeeze(1), power_expanded.squeeze(1))
-            else:
-                decoder_out = self.decoder(z, snr_expanded.squeeze(1), None)
-
-            if use_nll and self.probabilistic_decoder:
-                x_mean, x_logvar = decoder_out
-                var = torch.exp(x_logvar)
-                recon_error = 0.5 * (x_logvar + (x_expanded - x_mean).pow(2) / var).mean(dim=(1, 2))
-            else:
-                x_recon = decoder_out if not self.probabilistic_decoder else decoder_out[0]
-                recon_error = ((x_expanded - x_recon) ** 2).mean(dim=(1, 2))
-
+            decoder_out = self.decoder(z, snr_exp, power_exp)
+            recon_error = self._compute_recon_error(x_exp, decoder_out, use_nll)
             recon_error = recon_error.view(batch_size, num_samples).mean(dim=1)
 
         if include_kl:
             from .vae import _compute_kl_divergence
             return recon_error + self.beta * _compute_kl_divergence(mu, logvar, reduce=False)
         return recon_error
+
+
+def _get_model_attr(config, name: str, default):
+    """Get optional model attribute with default value."""
+    return getattr(config.model, name, default)
 
 
 def create_model(config) -> nn.Module:
@@ -704,26 +710,18 @@ def create_model(config) -> nn.Module:
         return ConvVAE(**common_args, beta=config.model.beta)
 
     if model_type == "snr_vae":
-        use_power = getattr(config.model, 'use_power_conditioning', False)
-        probabilistic = getattr(config.model, 'probabilistic_decoder', False)
-        smoothness_lambda = getattr(config.model, 'smoothness_lambda', 0.0)
-        use_bayesian = getattr(config.model, 'use_bayesian_encoder', False)
-        bll_prior_std = getattr(config.model, 'bll_prior_std', 1.0)
-        bll_kl_weight = getattr(config.model, 'bll_kl_weight', 1e-4)
-        phase_loss_weight = getattr(config.model, 'phase_loss_weight', 0.0)
-        inst_freq_loss_weight = getattr(config.model, 'inst_freq_loss_weight', 0.0)
         return SNRConditionedVAE(
             **common_args,
             snr_embedding_dim=config.model.snr_embedding_dim,
             beta=config.model.beta,
-            use_power_conditioning=use_power,
-            probabilistic_decoder=probabilistic,
-            smoothness_lambda=smoothness_lambda,
-            use_bayesian_encoder=use_bayesian,
-            bll_prior_std=bll_prior_std,
-            bll_kl_weight=bll_kl_weight,
-            phase_loss_weight=phase_loss_weight,
-            inst_freq_loss_weight=inst_freq_loss_weight,
+            use_power_conditioning=_get_model_attr(config, "use_power_conditioning", False),
+            probabilistic_decoder=_get_model_attr(config, "probabilistic_decoder", False),
+            smoothness_lambda=_get_model_attr(config, "smoothness_lambda", 0.0),
+            use_bayesian_encoder=_get_model_attr(config, "use_bayesian_encoder", False),
+            bll_prior_std=_get_model_attr(config, "bll_prior_std", 1.0),
+            bll_kl_weight=_get_model_attr(config, "bll_kl_weight", 1e-4),
+            phase_loss_weight=_get_model_attr(config, "phase_loss_weight", 0.0),
+            inst_freq_loss_weight=_get_model_attr(config, "inst_freq_loss_weight", 0.0),
         )
 
     raise ValueError(f"Unknown model type: {model_type}")

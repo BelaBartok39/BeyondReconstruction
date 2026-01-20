@@ -75,10 +75,8 @@ class SyntheticRFGenerator:
         self.symbol_rate = float(symbol_rate)
         self.carrier_freq = float(carrier_freq)
         self.rng = np.random.default_rng(seed)
-
         self.samples_per_symbol = int(self.sample_rate / self.symbol_rate)
 
-        # Constellation mappings
         self._constellations = {
             Modulation.BPSK: self._bpsk_constellation(),
             Modulation.QPSK: self._qpsk_constellation(),
@@ -86,7 +84,6 @@ class SyntheticRFGenerator:
             Modulation.QAM64: self._qam64_constellation(),
         }
 
-        # Anomaly generators
         self._anomaly_generators: dict[AnomalyType, Callable] = {
             AnomalyType.INTERFERENCE: self._add_interference,
             AnomalyType.FREQUENCY_DRIFT: self._add_frequency_drift,
@@ -94,6 +91,39 @@ class SyntheticRFGenerator:
             AnomalyType.PHASE_NOISE: self._add_phase_noise,
             AnomalyType.BURST_NOISE: self._add_burst_noise,
         }
+
+    def _parse_modulation(self, modulation: str | Modulation) -> Modulation:
+        """Convert string modulation to Modulation enum."""
+        if isinstance(modulation, str):
+            return Modulation(modulation.lower())
+        return modulation
+
+    def _resolve_snr(
+        self, snr_db: float | None, snr_range: tuple[float, float]
+    ) -> float:
+        """Return provided SNR or sample randomly from range."""
+        if snr_db is not None:
+            return snr_db
+        return float(self.rng.uniform(*snr_range))
+
+    def _generate_base_signal(self, modulation: Modulation) -> NDArray[np.complex128]:
+        """Generate pulse-shaped signal with carrier for given modulation."""
+        num_symbols = self.sequence_length // self.samples_per_symbol + 10
+        symbols = self._generate_symbols(modulation, num_symbols)
+        signal = self._pulse_shape(symbols)
+        return self._add_carrier(signal)
+
+    def _to_iq_array(
+        self, signal: NDArray[np.complex128]
+    ) -> tuple[NDArray[np.float32], float]:
+        """Normalize signal and convert to [2, seq_len] IQ format.
+
+        Returns:
+            Tuple of (IQ array, power_db before normalization).
+        """
+        normalized, power_db = self._normalize_signal(signal)
+        iq = np.stack([normalized.real, normalized.imag], axis=0).astype(np.float32)
+        return iq, power_db
 
     @staticmethod
     def _bpsk_constellation() -> NDArray[np.complex128]:
@@ -248,25 +278,18 @@ class SyntheticRFGenerator:
         Returns:
             Tuple of (IQ array [2, seq_len], metadata).
         """
-        modulation = Modulation(modulation.lower()) if isinstance(modulation, str) else modulation
-        snr_db = snr_db if snr_db is not None else self.rng.uniform(*snr_range)
+        mod = self._parse_modulation(modulation)
+        snr = self._resolve_snr(snr_db, snr_range)
 
-        # Generate, shape, and modulate signal
-        num_symbols = self.sequence_length // self.samples_per_symbol + 10
-        symbols = self._generate_symbols(modulation, num_symbols)
-        signal = self._pulse_shape(symbols)
-        signal = self._add_carrier(signal)
-        signal = self._add_awgn(signal, snr_db)
-        signal, power_db = self._normalize_signal(signal)
-
-        # Convert to [2, seq_len] IQ format
-        iq = np.stack([signal.real, signal.imag], axis=0).astype(np.float32)
+        signal = self._generate_base_signal(mod)
+        signal = self._add_awgn(signal, snr)
+        iq, power_db = self._to_iq_array(signal)
 
         return iq, SignalMetadata(
-            modulation=modulation.value,
-            snr_db=float(snr_db),
+            modulation=mod.value,
+            snr_db=snr,
             is_anomaly=False,
-            signal_power_db=float(power_db),
+            signal_power_db=power_db,
         )
 
     def _add_interference(
@@ -435,6 +458,16 @@ class SyntheticRFGenerator:
             "bursts": burst_params,
         }
 
+    def _parse_anomaly_type(
+        self, anomaly_type: str | AnomalyType | None
+    ) -> AnomalyType:
+        """Convert anomaly type input to AnomalyType enum, or select randomly."""
+        if anomaly_type is None:
+            return self.rng.choice(list(AnomalyType))
+        if isinstance(anomaly_type, str):
+            return AnomalyType(anomaly_type.lower())
+        return anomaly_type
+
     def generate_anomaly(
         self,
         anomaly_type: str | AnomalyType | None = None,
@@ -455,38 +488,23 @@ class SyntheticRFGenerator:
         Returns:
             Tuple of (IQ array [2, seq_len], metadata).
         """
-        # Parse inputs
-        if anomaly_type is None:
-            anomaly_type = self.rng.choice(list(AnomalyType))
-        else:
-            anomaly_type = AnomalyType(anomaly_type.lower()) if isinstance(anomaly_type, str) else anomaly_type
+        anom_type = self._parse_anomaly_type(anomaly_type)
+        mod = self._parse_modulation(base_modulation)
+        snr = self._resolve_snr(snr_db, snr_range)
 
-        base_modulation = Modulation(base_modulation.lower()) if isinstance(base_modulation, str) else base_modulation
-        snr_db = snr_db if snr_db is not None else self.rng.uniform(*snr_range)
-
-        # Generate base signal with anomaly
-        num_symbols = self.sequence_length // self.samples_per_symbol + 10
-        symbols = self._generate_symbols(base_modulation, num_symbols)
-        signal = self._pulse_shape(symbols)
-        signal = self._add_carrier(signal)
-
-        # Apply anomaly before noise
-        anomaly_func = self._anomaly_generators[anomaly_type]
-        signal, anomaly_params = anomaly_func(signal, snr_db, **anomaly_kwargs)
-
-        signal = self._add_awgn(signal, snr_db)
-        signal, power_db = self._normalize_signal(signal)
-
-        # Convert to [2, seq_len] IQ format
-        iq = np.stack([signal.real, signal.imag], axis=0).astype(np.float32)
+        signal = self._generate_base_signal(mod)
+        anomaly_func = self._anomaly_generators[anom_type]
+        signal, anomaly_params = anomaly_func(signal, snr, **anomaly_kwargs)
+        signal = self._add_awgn(signal, snr)
+        iq, power_db = self._to_iq_array(signal)
 
         return iq, SignalMetadata(
-            modulation=base_modulation.value,
-            snr_db=float(snr_db),
+            modulation=mod.value,
+            snr_db=snr,
             is_anomaly=True,
-            anomaly_type=anomaly_type.value,
+            anomaly_type=anom_type.value,
             anomaly_params=anomaly_params,
-            signal_power_db=float(power_db),
+            signal_power_db=power_db,
         )
 
     def generate_batch(
