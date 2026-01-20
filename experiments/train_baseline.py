@@ -18,12 +18,12 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.utils.config import load_config, save_config
-from src.data.synthetic import SyntheticRFGenerator
 from src.data.datasets import RFDataset, create_dataloaders
-from src.models.snr_encoder import create_model
+from src.data.synthetic import SyntheticRFGenerator
 from src.detection.detector import AnomalyDetector
 from src.detection.metrics import compute_metrics
+from src.models.snr_encoder import create_model
+from src.utils.config import Config, load_config, save_config
 
 
 logging.basicConfig(
@@ -31,6 +31,36 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def extract_batch_tensors(
+    batch: dict[str, torch.Tensor],
+    device: torch.device,
+    include_labels: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    """Extract and move batch tensors to device.
+
+    Args:
+        batch: Batch dictionary from DataLoader.
+        device: Target device for tensors.
+        include_labels: Whether to include labels in output.
+
+    Returns:
+        Tuple of (iq, snr, power, labels). Labels is None if include_labels=False.
+    """
+    iq = batch["iq"].to(device)
+    snr = batch.get("snr")
+    power = batch.get("power")
+    labels = batch.get("label") if include_labels else None
+
+    if snr is not None:
+        snr = snr.to(device)
+    if power is not None:
+        power = power.to(device)
+    if labels is not None:
+        labels = labels.to(device)
+
+    return iq, snr, power, labels
 
 
 def get_model_capabilities(model: nn.Module) -> tuple[bool, bool, bool, bool]:
@@ -148,7 +178,7 @@ def compute_contrastive_loss(
     return normal_loss + anomaly_loss
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Train RF anomaly detection model")
     parser.add_argument("--config", default="configs/default.yaml", help="Path to config file")
@@ -197,17 +227,7 @@ def train_epoch(
     num_batches = 0
 
     for batch in tqdm(train_loader, desc="Training", leave=False):
-        iq = batch["iq"].to(device)
-        snr = batch.get("snr")
-        power = batch.get("power")
-        labels = batch.get("label")
-        if snr is not None:
-            snr = snr.to(device)
-        if power is not None:
-            power = power.to(device)
-        if labels is not None:
-            labels = labels.to(device)
-
+        iq, snr, power, labels = extract_batch_tensors(batch, device, include_labels=True)
         optimizer.zero_grad()
 
         # Forward and compute loss
@@ -254,14 +274,7 @@ def validate(model: nn.Module, val_loader: DataLoader, device: torch.device) -> 
     total_loss = 0.0
 
     for batch in val_loader:
-        iq = batch["iq"].to(device)
-        snr = batch.get("snr")
-        power = batch.get("power")
-        if snr is not None:
-            snr = snr.to(device)
-        if power is not None:
-            power = power.to(device)
-
+        iq, snr, power, _ = extract_batch_tensors(batch, device)
         x_recon, x_recon_logvar, mu, logvar, _ = model_forward(
             model, iq, snr, power, is_snr_conditioned, is_vae, uses_power, is_probabilistic
         )
@@ -276,7 +289,7 @@ def evaluate_detection(
     train_loader: DataLoader,
     test_loader: DataLoader,
     device: torch.device,
-    config
+    config: Config,
 ) -> dict[str, float]:
     """Evaluate anomaly detection performance.
 
@@ -326,7 +339,33 @@ def evaluate_detection(
     }
 
 
-def main():
+def save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    val_loss: float | None = None,
+) -> None:
+    """Save model checkpoint.
+
+    Args:
+        path: Path to save checkpoint.
+        model: Model to save.
+        optimizer: Optimizer to save.
+        epoch: Current epoch number.
+        val_loss: Validation loss (optional, for best model checkpoints).
+    """
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    if val_loss is not None:
+        checkpoint["val_loss"] = val_loss
+    torch.save(checkpoint, path)
+
+
+def main() -> None:
     """Main training function."""
     args = parse_args()
 
@@ -341,7 +380,8 @@ def main():
     torch.manual_seed(config.experiment.seed)
 
     # Setup device and output directory
-    device = get_device(args.device if args.device != "auto" else config.experiment.device)
+    device_str = args.device if args.device != "auto" else config.experiment.device
+    device = get_device(device_str)
     logger.info(f"Using device: {device}")
 
     output_dir = Path(args.output_dir) if args.output_dir else (
@@ -458,12 +498,9 @@ def main():
         if val_metrics["val_loss"] < best_val_loss:
             best_val_loss = val_metrics["val_loss"]
             patience_counter = 0
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": val_metrics["val_loss"],
-            }, output_dir / "best_model.pt")
+            save_checkpoint(
+                output_dir / "best_model.pt", model, optimizer, epoch, val_metrics["val_loss"]
+            )
         else:
             patience_counter += 1
 
@@ -472,11 +509,7 @@ def main():
             break
 
         if epoch % config.experiment.checkpoint_interval == 0:
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-            }, output_dir / f"checkpoint_epoch_{epoch}.pt")
+            save_checkpoint(output_dir / f"checkpoint_epoch_{epoch}.pt", model, optimizer, epoch)
 
     # Load best model for evaluation
     checkpoint = torch.load(output_dir / "best_model.pt", weights_only=True)

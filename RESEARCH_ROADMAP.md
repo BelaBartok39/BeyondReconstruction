@@ -1,6 +1,6 @@
 # Research Roadmap for Academic Publishing
 
-**Last Updated:** 2026-01-19
+**Last Updated:** 2026-01-19 (POWDER DSSS validation added)
 
 ## Current State Summary
 
@@ -11,6 +11,7 @@
 - Hybrid detection improves continuous learning by 3.8-5.9%
 - **Frequency drift detection: 0.9245 AUROC** with ChirpDetector (up from 0.79 baseline)
 - **Live HackRF validation: 0.9735 AUROC** on real captured RF signals
+- **POWDER DSSS validation: 0.8882 AUROC** on real LTE with spread-spectrum interference (unseen anomaly type)
 
 **Key Innovations:**
 1. **Latent-only detection** (Mahalanobis distance) outperforms reconstruction-based (0.93 vs 0.42)
@@ -97,12 +98,21 @@ Result: **0.9245 AUROC** on frequency drift (vs 0.79 for latent-only)
 ### Phase 1: Strengthen Experimental Validation (1-2 weeks)
 
 #### 1.1 Real RF Data Validation
-**Status: PARTIALLY COMPLETE**
+**Status: MOSTLY COMPLETE**
 
 - [x] Test on HackRF-captured WiFi signals (0.9735 AUROC achieved)
+- [x] Test on POWDER LTE+DSSS dataset (0.8882 AUROC - real spread-spectrum interference)
 - [ ] Acquire RadioML or DARPA RFML datasets
-- [ ] Test on real-world interference scenarios
 - [ ] Document domain adaptation requirements
+
+**POWDER Dataset Results (2026-01-19):**
+| Method | AUROC | Notes |
+|--------|-------|-------|
+| Latent-only | 0.7319 | Model trained on synthetic data |
+| Amplitude threshold | 0.7734 | Simple baseline |
+| **Hybrid (Lat+Amp+Freq)** | **0.8882** | +11.5% over baseline |
+
+Key finding: DSSS is a power-adding anomaly where amplitude helps, but hybrid detection still outperforms.
 
 #### 1.2 Baseline Comparisons
 **Status: PARTIALLY COMPLETE**

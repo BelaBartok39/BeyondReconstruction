@@ -144,5 +144,65 @@ Environment path: `/project/ndrdmond/pythonGPU` (case-sensitive)
 | Overall AUROC (hybrid) | 0.9549 |
 | Frequency drift (ChirpDetector) | 0.9245 |
 | Generalization to unseen anomalies | 0.9970 |
+| POWDER DSSS (unseen anomaly) | 0.8882 |
 
 Production model: `snr_conditioned_vae_hybrid_v1.pt`
+
+## After Significant Experiments
+
+When an experiment achieves notable results, update the documentation:
+
+**What counts as significant:**
+- New dataset validation (real-world data)
+- >5% AUROC improvement
+- New anomaly type detection
+- New capability or method
+- Important negative result (what doesn't work)
+
+**Documents to update:**
+
+1. **README.md**
+   - Add to "Validation Datasets" table
+   - Update "Supported Anomaly Types" if new type
+   - Add new experiment command if applicable
+
+2. **RESEARCH_ROADMAP.md**
+   - Update "Achieved Results" bullet list
+   - Mark checklist items as complete `[x]`
+   - Add results table under relevant section
+   - Update "Status" labels (PARTIALLY COMPLETE → MOSTLY COMPLETE)
+
+3. **LEARNING_JOURNEY.md**
+   - Add new "## Section" with discovery narrative
+   - Include "### Key Discovery" with explanation
+   - Add results table
+   - Add "### Lesson Learned" with blockquote
+   - Update "Quick Reference: What We Learned" table
+   - Add new files to "Appendix: Key Files" table
+
+**Style guidelines:**
+- README: Concise, practical, code-focused
+- RESEARCH_ROADMAP: Academic, evidence-based, uses checkboxes
+- LEARNING_JOURNEY: Narrative, educational, explains "why"
+
+## After Writing Code
+
+After creating or significantly modifying a Python file (>50 lines or new functionality), run the `code-simplifier:code-simplifier` agent to:
+
+1. Remove code duplication
+2. Extract helper functions for repeated patterns
+3. Add type hints consistent with codebase style
+4. Consolidate imports at module top
+5. Use `pathlib.Path` instead of `os.path`
+6. Ensure consistent quote style (double quotes)
+7. Remove unnecessary complexity
+
+**Trigger conditions:**
+- New experiment scripts (`experiments/*.py`)
+- New test files (`tests/*.py`)
+- Modifications to core modules (`src/**/*.py`)
+- Any file with >50 lines of new code
+
+**Skip for:**
+- Config files, documentation, minor edits (<10 lines)
+- Quick debugging scripts meant to be temporary

@@ -163,6 +163,22 @@ pytest tests/
 pytest tests/ --cov=src --cov-report=html
 ```
 
+## Validation Datasets
+
+The model has been validated on multiple real-world datasets:
+
+| Dataset | Type | AUROC | Notes |
+|---------|------|-------|-------|
+| HackRF WiFi | Live capture | 0.9735 | 200 samples at 2.437 GHz |
+| POWDER LTE+DSSS | Real LTE | 0.8882 | Spread-spectrum interference |
+| MIT 5G | Jammed 5G | TBD | 1.6 GB dataset available |
+
+### Test on POWDER Dataset
+
+```bash
+python experiments/test_powder_data.py
+```
+
 ## Key Technical Details
 
 ### Data Format
@@ -183,6 +199,7 @@ anomaly_score = reconstruction_error / expected_error(snr)
 - Amplitude spikes
 - Phase noise
 - Burst noise
+- **DSSS interference** (validated on POWDER dataset)
 
 ## Dependencies
 

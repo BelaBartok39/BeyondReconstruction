@@ -1,7 +1,5 @@
 # Datasets (large files)
-MIT_DATA/*.h5
-MIT_DATA/*.csv
-MIT_DATA/*.xlsx
+RED_DATA/
 
 # Python
 __pycache__/

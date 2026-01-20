@@ -1,6 +1,6 @@
 # RF Anomaly Detection: A Learning Journey
 
-**Last Updated:** 2026-01-18
+**Last Updated:** 2026-01-19
 
 ## From 42% to 95.5% AUROC - How We Got Here
 
@@ -503,6 +503,7 @@ Week 4: Conditioning + Hybrid methods
 | `src/data/synthetic.py` | Synthetic RF signal generation |
 | `experiments/validate_best_config.py` | Validates our best configuration |
 | `experiments/test_improved_detection.py` | Tests hybrid detection methods |
+| `experiments/test_powder_data.py` | Tests on POWDER LTE+DSSS dataset |
 | `configs/default.yaml` | All hyperparameters |
 
 ---
@@ -516,6 +517,7 @@ Week 4: Conditioning + Hybrid methods
 | Phase info lost in real values | Add frequency features at detection | 0.93 → 0.9549 AUROC |
 | Phase loss during training | Don't do it - destabilizes | (failed) |
 | Complex-valued networks | Not worth the instability | (failed) |
+| DSSS inverts freq features | Auto-detect and invert features | 0.73 → 0.89 AUROC |
 
 ---
 
@@ -620,6 +622,56 @@ The model earns its complexity for **spectral anomalies** (chirps, tones, barrag
 - Use VAE latent space for spectral anomaly detection
 - Use ChirpDetector for frequency drift
 - Use hybrid ensemble for unknown/mixed threats
+
+---
+
+## POWDER Dataset: Testing on Real LTE with DSSS Interference
+
+### The Experiment (2026-01-19)
+
+We obtained the POWDER dataset containing real LTE signals with and without DSSS (Direct Sequence Spread Spectrum) interference. This is a completely different anomaly type than anything in our synthetic training data.
+
+**Dataset Details:**
+- Normal: 250 files of clean LTE signals
+- Anomaly: 1000 files of LTE + DSSS interference (SIR = -10 dB)
+- Bandwidth: 10 MHz at 11.52 MHz sample rate
+- Format: Complex64 I/Q samples (~912,600 samples per file)
+
+### Key Discovery: Frequency Features Invert for Spread Spectrum
+
+We discovered that DSSS interference causes **inverted** frequency feature relationships:
+
+| Feature | Normal LTE | LTE + DSSS | Why |
+|---------|------------|------------|-----|
+| Spectral entropy | Higher | Lower | LTE has structured subcarriers; DSSS fills in the spectrum |
+| Spectral bandwidth | Higher | Lower | DSSS spreads uniformly, reducing measured bandwidth variation |
+| Spectral flatness | Higher | Lower | DSSS makes spectrum more uniform |
+
+This makes sense when you understand DSSS: it's designed to spread energy across a wide bandwidth, making it look more like noise. When added to LTE (which has distinct spectral peaks), it actually "fills in" the spectrum, reducing entropy.
+
+### Results
+
+| Method | AUROC | Notes |
+|--------|-------|-------|
+| Latent-only (Mahalanobis) | 0.7319 | Trained on synthetic data |
+| Amplitude threshold | 0.7734 | Simple baseline |
+| Spectral bandwidth (inverted) | 0.7506 | Single frequency feature |
+| **Latent + Amp + Freq** | **0.8882** | Best hybrid approach |
+
+### Why Hybrid Detection Wins
+
+DSSS interference adds power across the bandwidth, so:
+1. **Amplitude** detects the power increase (+4.4x mean amplitude)
+2. **Latent space** captures structural changes in the signal
+3. **Frequency features** (inverted) detect the spectral flattening
+
+No single method captures all aspects—the combination is synergistic.
+
+### Lesson Learned
+
+> **Frequency feature relationships can invert depending on anomaly type. Always check AUROC direction and auto-invert if needed.**
+
+This is now implemented in `experiments/test_powder_data.py`.
 
 ---
 
