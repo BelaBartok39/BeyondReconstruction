@@ -545,17 +545,116 @@ snr_conditioned_vae_hybrid_v1.pt (21 MB)
 
 ---
 
-## Next Challenge: Frequency Drift to 0.9+
+## Frequency Drift Target: ACHIEVED with ChirpDetector
 
-Current: **0.8467** | Target: **0.9+**
+**Final Result: 0.9245 AUROC** (target was 0.9+)
 
-Frequency drift is the hardest anomaly because its signature (phase variance) overlaps with normal signal variation. Proposed approaches:
-1. Adaptive weighting based on detected phase instability
-2. Specialized drift features (chirp rate, phase unwrapping)
-3. Two-stage detection (detect first, then classify)
+### Why Frequency Drift is the Hardest Anomaly
+
+Frequency drift is fundamentally different from other anomalies because it affects **phase**, not amplitude:
+
+| Feature | Normal | Freq Drift | Detectability |
+|---------|--------|------------|---------------|
+| Peak Amplitude | 1.40 | 1.41 | Identical |
+| Mean Power | 1.15 | 1.16 | Identical |
+| Latent cosine similarity | 1.00 | **0.92** | Too similar |
+| Quadratic phase coeff | 8e-9 | **2e-4** | 23,000x different |
+
+### The Physics
+
+Frequency drift = carrier frequency changes linearly with time:
+```
+f(t) = f₀ + k·t
+```
+
+Integrating to get phase:
+```
+φ(t) = 2π∫f(t)dt = 2π(f₀·t + k·t²/2)
+                        ↑         ↑
+                     linear    QUADRATIC term
+```
+
+The **quadratic term** is the smoking gun—but amplitude-based detection can't see it, and the VAE latent space barely captures it because convolutional encoders are partially frequency-shift invariant.
+
+### ChirpDetector Solution
+
+Instead of relying on the VAE, ChirpDetector uses domain-specific physics:
+
+1. **Fits quadratic polynomial to unwrapped phase** → drift has low residual
+2. **Computes linear vs quadratic fit ratio** → drift shows huge improvement with quadratic
+3. **Measures instantaneous frequency slope** → drift has systematic trend
+4. **Computes IF R²** → drift has high linearity (not random noise)
+
+Result: 0.9245 AUROC on frequency drift (vs 0.79 for latent-only)
+
+---
+
+## When Does the Model Beat Simple Baselines?
+
+### Honest Assessment
+
+Tested on HackRF-captured WiFi signals (200 samples):
+
+| Method | Overall AUROC |
+|--------|---------------|
+| Peak Amplitude | 0.9293 |
+| Mean Power (dB) | 0.9094 |
+| **Our Model** | **0.9735** |
+
+### Per-Anomaly Breakdown
+
+| Anomaly Type | Amplitude | Model | Advantage |
+|--------------|-----------|-------|-----------|
+| amplitude_spike | **1.000** | **1.000** | None (equal) |
+| burst_noise | 0.977 | **0.999** | +2% |
+| chirp | 0.880 | **0.970** | **+9%** |
+| barrage | 0.875 | **0.969** | **+9%** |
+| tone | 0.867 | **0.899** | +3% |
+
+### Key Insight
+
+The model earns its complexity for **spectral anomalies** (chirps, tones, barrage) where amplitude alone is insufficient. For power-based anomalies (spikes, bursts), a simple threshold works nearly as well.
+
+**Recommendation:**
+- Use amplitude threshold for power-monitoring systems
+- Use VAE latent space for spectral anomaly detection
+- Use ChirpDetector for frequency drift
+- Use hybrid ensemble for unknown/mixed threats
+
+---
+
+## Live HackRF Validation
+
+### TorchRF Testbed
+
+Built a complete live detection system:
+
+```
+TorchRF_Testbed/
+├── src/
+│   ├── capture.py      # HackRF via GNURadio
+│   ├── detector.py     # Model inference wrapper
+│   ├── injection.py    # Software anomaly injection
+│   └── recorder.py     # HDF5 recording
+├── scripts/
+│   ├── live_detect.py  # Interactive CLI
+│   ├── record_session.py
+│   └── replay_test.py
+└── data/
+    └── hackrf_dataset.h5
+```
+
+### Results on Real WiFi Signals
+
+- **Frequency:** 2.437 GHz (WiFi Channel 6)
+- **Samples:** 200 (140 normal, 60 anomalies)
+- **AUROC:** 0.9735
+- **F1 Score:** 0.9355
+
+The model generalizes from synthetic training data to real HackRF captures.
 
 ---
 
 *Document created: January 2026*
 *Research collaboration with Claude (Anthropic)*
-*Last validated: 2026-01-18 (Jobs 1988564, 1988565)*
+*Last validated: 2026-01-19 (HackRF live testing)*

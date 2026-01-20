@@ -1,0 +1,59 @@
+# TorchRF Testbed Configuration
+
+# HackRF capture settings
+capture:
+  center_freq: 915000000    # Hz (915 MHz)
+  sample_rate: 2000000      # Hz (2 MHz)
+  gain: 40                  # dB
+  buffer_size: 1024         # samples per capture
+  if_gain: 20               # IF gain dB
+  bb_gain: 20               # Baseband gain dB
+
+# Model settings
+model:
+  path: "../snr_conditioned_vae_hybrid_v1.pt"
+  config: "../configs/default.yaml"
+  device: "cpu"             # "cpu" or "cuda"
+
+# Detection settings
+detection:
+  method: "latent"          # "latent", "reconstruction", or "hybrid"
+  threshold_percentile: 95
+  snr_range: [-5, 30]       # dB
+  power_range: [-20, 10]    # dB
+  snr_adaptive: true
+
+# Anomaly injection settings
+injection:
+  default_severity: 1.0
+  jsr_range: [0, 20]        # Jammer-to-signal ratio range (dB)
+  sir_range: [-10, 10]      # Signal-to-interference ratio range (dB)
+
+  # Per-anomaly type defaults
+  tone:
+    frequency_offset: 0.1   # Normalized frequency offset
+    sir_db: 0
+  chirp:
+    start_freq: -0.3
+    end_freq: 0.3
+    sir_db: 0
+  barrage:
+    bandwidth: 0.8          # Normalized bandwidth
+    jsr_db: 0
+  pulse:
+    duty_cycle: 0.2
+    jsr_db: 3
+  multi_tone:
+    num_tones: 3
+    sir_db: 0
+
+# Recording settings
+recording:
+  chunk_size: 100           # Samples per HDF5 chunk
+  compression: "gzip"
+  compression_level: 4
+
+# Display settings
+display:
+  update_rate: 10           # Hz
+  history_length: 100       # Number of samples to show in history

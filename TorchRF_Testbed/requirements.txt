@@ -1,0 +1,13 @@
+# TorchRF Testbed Dependencies
+# Note: gnuradio and gr-osmosdr are typically installed via system package manager
+
+# Core dependencies
+numpy>=1.21.0
+torch>=2.0.0
+h5py>=3.0.0
+pyyaml>=6.0
+
+# Signal processing
+scipy>=1.9.0
+
+# CLI interface

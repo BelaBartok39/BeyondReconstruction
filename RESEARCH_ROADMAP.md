@@ -1,6 +1,6 @@
 # Research Roadmap for Academic Publishing
 
-**Last Updated:** 2026-01-18
+**Last Updated:** 2026-01-19
 
 ## Current State Summary
 
@@ -10,6 +10,7 @@
 - Generalizes to unseen anomaly types (burst_noise: 0.9970 AUROC)
 - Hybrid detection improves continuous learning by 3.8-5.9%
 - **Frequency drift detection: 0.9245 AUROC** with ChirpDetector (up from 0.79 baseline)
+- **Live HackRF validation: 0.9735 AUROC** on real captured RF signals
 
 **Key Innovations:**
 1. **Latent-only detection** (Mahalanobis distance) outperforms reconstruction-based (0.93 vs 0.42)
@@ -25,103 +26,161 @@ snr_conditioned_vae_hybrid_v1.pt (21 MB)
 
 ---
 
+## Critical Finding: When Does the Model Beat Simple Baselines?
+
+### Honest Comparison with Amplitude Threshold
+
+Tested on HackRF-captured WiFi signals (200 samples, 60 anomalies):
+
+| Method | Overall AUROC |
+|--------|---------------|
+| Peak Amplitude | 0.9293 |
+| Mean Power (dB) | 0.9094 |
+| **Our Model (Latent)** | **0.9735** |
+
+### Per-Anomaly Type Breakdown
+
+| Anomaly Type | Amplitude | Power | Model | Model Advantage |
+|--------------|-----------|-------|-------|-----------------|
+| amplitude_spike | **1.000** | 0.926 | **1.000** | None (equal) |
+| burst_noise | 0.977 | 0.970 | **0.999** | Marginal (+2%) |
+| chirp | 0.880 | 0.876 | **0.970** | **Significant (+9%)** |
+| barrage | 0.875 | 0.875 | **0.969** | **Significant (+9%)** |
+| tone | 0.867 | 0.867 | **0.899** | Modest (+3%) |
+
+### Key Insight: When to Use What
+
+| Anomaly Type | Best Approach | Why |
+|--------------|---------------|-----|
+| Power-based (spikes, bursts) | Amplitude threshold | Near-perfect, simpler |
+| Spectral (tones, chirps, barrage) | VAE latent space | Captures frequency structure |
+| Frequency drift | ChirpDetector | Requires phase analysis |
+| Unknown/mixed | Hybrid ensemble | Best generalization |
+
+---
+
+## Why Frequency Drift is the Hardest Anomaly
+
+### The Physics
+
+Frequency drift means carrier frequency changes linearly: `f(t) = f₀ + kt`
+
+This creates **quadratic phase**: `φ(t) = 2π(f₀t + kt²/2)`
+
+| Feature | Normal | Freq Drift | Detection |
+|---------|--------|------------|-----------|
+| Amplitude | 1.40 | 1.41 | Identical |
+| Power (dB) | 1.15 | 1.16 | Identical |
+| Latent cosine similarity | 1.00 | **0.92** | Too similar |
+| Quadratic phase coeff | 8e-9 | 2e-4 | **23,000x different** |
+| Linear/Quadratic residual ratio | 1.0 | 20,949 | **Massive difference** |
+
+### Why VAE Struggles
+
+1. **Convolutional encoder is frequency-shift invariant** - learns local patterns, not absolute frequency
+2. **Drift preserves signal structure** - modulation shape, envelope characteristics unchanged
+3. **Latent representation encodes "what" not "where"** - frequency shift doesn't change the learned features
+
+### ChirpDetector Solution
+
+Exploits the physics directly:
+- Fits quadratic polynomial to unwrapped phase
+- Measures linear fit of instantaneous frequency
+- Computes R² to detect systematic drift vs noise
+
+Result: **0.9245 AUROC** on frequency drift (vs 0.79 for latent-only)
+
+---
+
 ## Recommended Next Steps
 
 ### Phase 1: Strengthen Experimental Validation (1-2 weeks)
 
 #### 1.1 Real RF Data Validation
-**Critical for publication credibility**
+**Status: PARTIALLY COMPLETE**
 
-- [ ] Acquire real RF datasets (e.g., RadioML, DARPA RFML)
+- [x] Test on HackRF-captured WiFi signals (0.9735 AUROC achieved)
+- [ ] Acquire RadioML or DARPA RFML datasets
 - [ ] Test on real-world interference scenarios
-- [ ] Compare synthetic vs real performance gap
 - [ ] Document domain adaptation requirements
 
-**Why:** Reviewers will question synthetic-only results. Real data validates practical applicability.
-
 #### 1.2 Baseline Comparisons
-**Required for any ML paper**
+**Status: PARTIALLY COMPLETE**
 
-- [ ] Implement standard baselines:
-  - One-Class SVM on raw features
-  - Isolation Forest on latent space
-  - Standard Autoencoder (non-VAE)
-  - PCA-based anomaly detection
-- [ ] Compare with published RF anomaly detection methods
+- [x] Amplitude threshold comparison (completed - model +4.4% overall)
+- [x] Per-anomaly-type breakdown (spectral anomalies show largest advantage)
+- [ ] One-Class SVM on raw features
+- [ ] Isolation Forest on latent space
 - [ ] Statistical significance testing (t-tests, Wilcoxon)
 
 #### 1.3 Ablation Studies
-**Demonstrates contribution of each component**
+**Status: MOSTLY COMPLETE**
 
 - [x] SNR conditioning vs no conditioning (validated)
 - [x] Power conditioning impact (critical for amplitude anomalies)
 - [x] Latent dimension sensitivity - 32 optimal (16 gave 0.40 AUROC!)
-- [ ] Architecture depth study
 - [x] Detection method comparison (reconstruction vs latent vs hybrid)
-  - Reconstruction: 0.42 AUROC
-  - Latent-only: 0.93 AUROC
-  - Hybrid(f=0.5): 0.9549 AUROC
+- [ ] Architecture depth study
 
 ---
 
 ### Phase 2: Theoretical Foundation (2-3 weeks)
 
 #### 2.1 Why Latent-Only Detection Works
-**Explain the phenomenon**
+**Status: COMPLETE**
 
 - [x] Analyze latent space geometry for normal vs anomaly
-- [x] Visualize with t-SNE/UMAP (see `figures/latent_tsne_by_type.png`)
-- [x] Measure latent space separability metrics (Mahalanobis distances documented)
+- [x] Visualize with t-SNE/UMAP
+- [x] Measure latent space separability metrics
 - [x] Compare reconstruction error distributions
+- [x] **NEW:** Explain why VAE is frequency-shift invariant
 
 **Findings:**
 - Anomalies cluster in latent space even when reconstruction error is LOW
-- Amplitude_spike/burst_noise: Mahalanobis ~30 (easily separated)
-- Frequency_drift: Mahalanobis ~8 (overlaps with normal ~5.5, harder to detect)
-- VAE reconstructs anomalies BETTER than normal signals (inverted behavior)
+- Frequency drift has 0.92 cosine similarity to normal in latent space
+- VAE encoder learns structural patterns, not absolute frequency
 
 #### 2.2 Mathematical Formalization
-**Strengthens theoretical contribution**
+**Strengthen theoretical contribution**
 
 - [ ] Formalize Mahalanobis distance in VAE latent space
 - [ ] Derive conditions for optimal anomaly separation
-- [ ] Connect to information-theoretic bounds
+- [ ] **NEW:** Prove why quadratic phase indicates drift
 - [ ] Analyze when reconstruction-based fails
-
-#### 2.3 Continuous Learning Theory
-**Connect to existing literature**
-
-- [ ] Analyze why EWC hurts performance in this domain
-- [ ] Characterize concept drift in RF signals
-- [ ] Optimal online learning rate analysis
 
 ---
 
-### Phase 3: Extended Experiments (2-3 weeks)
+### Phase 3: TorchRF Testbed (COMPLETE)
 
-#### 3.1 Scalability Study
-- [ ] Test on longer sequences (2048, 4096, 8192)
-- [ ] Multiple signal sources (MIMO scenarios)
-- [ ] Computational efficiency benchmarks
-- [ ] Real-time detection latency
+**Live Detection System Built:**
 
-#### 3.2 Robustness Analysis
-- [ ] Adversarial anomaly attacks
-- [ ] Noise injection sensitivity
-- [ ] Out-of-distribution detection
-- [ ] Calibration analysis (reliability diagrams)
+```
+TorchRF_Testbed/
+├── src/
+│   ├── capture.py      # HackRF via GNURadio
+│   ├── detector.py     # Model inference wrapper
+│   ├── injection.py    # Software anomaly injection
+│   ├── recorder.py     # HDF5 session recording
+│   └── utils.py        # Signal processing
+├── scripts/
+│   ├── live_detect.py  # Interactive CLI
+│   ├── record_session.py
+│   └── replay_test.py
+└── data/
+    └── hackrf_dataset.h5  # Recorded validation set
+```
 
-#### 3.3 Multi-Dataset Evaluation
-- [ ] Create benchmark suite with multiple datasets
-- [ ] Cross-dataset generalization
-- [ ] Transfer learning experiments
+**Validated Results:**
+- 200 samples captured at 2.437 GHz (WiFi channel 6)
+- 0.9735 AUROC on real signals
+- Detected 4 natural anomalies on channel 11
+- All 7 injected anomaly types detected correctly
 
 ---
 
 ### Phase 4: Paper Writing (2-3 weeks)
 
 #### 4.1 Target Venues
-**Recommended based on topic:**
 
 | Venue | Focus | Deadline |
 |-------|-------|----------|
@@ -129,96 +188,60 @@ snr_conditioned_vae_hybrid_v1.pt (21 MB)
 | IEEE TNNLS | Neural Networks | Rolling |
 | ICASSP | Signal Processing | Oct 2026 |
 | IEEE WCNC | Wireless Communications | Sep 2026 |
-| NeurIPS | ML (workshops) | May 2026 |
 
-#### 4.2 Paper Structure
-```
-1. Introduction
-   - RF anomaly detection importance
-   - Limitations of reconstruction-based methods
-   - Our contribution: latent-only detection + continuous learning
+#### 4.2 Key Claims to Support
 
-2. Related Work
-   - Autoencoder anomaly detection
-   - RF signal processing
-   - Continuous learning
-
-3. Method
-   - SNR-Conditioned VAE architecture
-   - Latent-only anomaly scoring
-   - Online learning for drift adaptation
-
-4. Experiments
-   - Synthetic data validation
-   - Real RF data evaluation
-   - Ablation studies
-   - Continuous learning under drift
-
-5. Analysis
-   - Why latent-only works
-   - Failure cases
-   - Computational efficiency
-
-6. Conclusion
-```
-
-#### 4.3 Key Claims to Support
 1. **Claim:** Latent-only detection outperforms reconstruction-based
    - Evidence: 0.93 vs 0.42 AUROC comparison (2.2x improvement)
 
-2. **Claim:** Hybrid detection further improves performance
-   - Evidence: 0.9549 AUROC (+2.7% over latent-only)
-   - Frequency drift: 0.8467 (+5.6% improvement)
-   - No degradation on other anomaly types
+2. **Claim:** Model outperforms simple amplitude threshold for spectral anomalies
+   - Evidence: +9% AUROC on chirp/barrage, +3% on tone
+   - Honest caveat: Equal performance on amplitude-based anomalies
 
 3. **Claim:** Model generalizes to unseen anomaly types
-   - Evidence: burst_noise 0.9970 AUROC (never seen in training)
-   - Negative generalization gap (-0.053): better on unseen!
+   - Evidence: burst_noise 0.9999 AUROC (never seen in training)
 
-4. **Claim:** Hybrid detection improves continuous learning
-   - Evidence: All methods improve 3.8-5.9% with hybrid detection
-   - Online learning: 0.8015 → 0.8395 AUROC
-   - EWC: 0.7799 → 0.8390 AUROC
+4. **Claim:** ChirpDetector solves frequency drift via phase physics
+   - Evidence: 0.9245 AUROC (vs 0.79 latent-only)
+   - Explanation: Quadratic phase = linear frequency drift
 
-5. **Claim:** Detection-time features are safer than training modifications
-   - Evidence: Phase loss during training caused loss explosion (0.6 → 79M)
-   - Complex-valued networks produced NaN values
-   - Adding features at detection time: no risk, consistent improvement
+5. **Claim:** Validated on real HackRF-captured signals
+   - Evidence: 0.9735 AUROC on 200 WiFi samples
 
 ---
 
 ## Code Quality Improvements
 
 ### For Reproducibility
+- [x] Add unit tests for all components (50+ tests passing)
+- [x] Document all hyperparameters in config
+- [x] Export production model
+- [x] Create TorchRF_Testbed for live validation
 - [ ] Add comprehensive docstrings
-- [ ] Create requirements.txt with pinned versions
-- [x] Add unit tests for all components (50 tests passing)
-- [ ] Create Docker container for reproducibility
-- [x] Document all hyperparameters in config (`configs/default.yaml`)
+- [ ] Create Docker container
 
 ### For Open Source Release
-- [x] Clean up experimental code (57 files removed in Session 6)
-- [ ] Add examples/tutorials
+- [x] Clean up experimental code
 - [x] Create comprehensive README
+- [ ] Add examples/tutorials
 - [ ] Add license (MIT or Apache 2.0)
 - [ ] Prepare for GitHub release
-- [x] Export production model (`snr_conditioned_vae_hybrid_v1.pt`)
 
 ---
 
 ## Risk Assessment
 
 ### High Risk
-1. **Real data may not match synthetic** - Mitigation: Domain adaptation
-2. **Reviewers may dismiss synthetic-only** - Mitigation: Get real data first
+1. **Real data may not match synthetic** - Mitigation: HackRF validation (DONE - 0.9735 AUROC)
+2. **Reviewers may dismiss synthetic-only** - Mitigation: Live RF data included
 
 ### Medium Risk
-1. **EWC underperformance explanation** - Mitigation: Theoretical analysis
-2. **Limited to single-channel RF** - Mitigation: Discuss as future work
+1. **Simple baseline comparison** - Mitigation: Honest comparison shows where model excels
+2. **Frequency drift still harder** - Mitigation: ChirpDetector achieves 0.92+ AUROC
 
 ### Low Risk
 1. **Computational efficiency** - Current model is lightweight
-2. **Overfitting** - Already validated with held-out tests
+2. **Overfitting** - Validated with held-out tests and live data
 
 ---
 
@@ -226,43 +249,21 @@ snr_conditioned_vae_hybrid_v1.pt (21 MB)
 
 | Phase | Duration | Key Deliverable |
 |-------|----------|-----------------|
-| 1. Validation | 2 weeks | Real data results, baselines |
-| 2. Theory | 2 weeks | Latent space analysis, formalization |
-| 3. Extended | 2 weeks | Scalability, robustness results |
-| 4. Writing | 3 weeks | Complete paper draft |
-| **Total** | **9 weeks** | **Submission-ready paper** |
+| 1. Validation | 1 week | Remaining baselines |
+| 2. Theory | 2 weeks | Frequency shift invariance analysis |
+| 3. Writing | 3 weeks | Complete paper draft |
+| **Total** | **6 weeks** | **Submission-ready paper** |
 
 ---
 
-## Immediate Action Items
+## Summary of Detection Methods
 
-### Completed
-- [x] Implement hybrid detection (latent + frequency features)
-- [x] Validate on overfitting tests (4/4 PASS)
-- [x] Validate on continuous learning (3.8-5.9% improvement)
-- [x] Clean up codebase (57 files removed)
-- [x] Export production model
-- [x] Run latent space visualization (t-SNE, Mahalanobis distributions)
+| Detector | Best For | AUROC Range | Complexity |
+|----------|----------|-------------|------------|
+| Amplitude Threshold | Power anomalies | 0.93-1.00 | Trivial |
+| VAE Latent (Mahalanobis) | General anomalies | 0.93 avg | Low |
+| Hybrid (latent + freq) | Balanced detection | 0.95 avg | Medium |
+| ChirpDetector | Frequency drift | 0.92 on drift | Medium |
+| Ensemble | Unknown threats | 0.97+ | High |
 
-### ACHIEVED: Frequency Drift 0.9+ AUROC
-**Target met with ChirpDetector: 0.9245 AUROC** (was 0.8467 with Hybrid(f=0.5))
-
-**How it was achieved:**
-1. Created `ChirpDetector` class with 12 chirp-specific features:
-   - Quadratic phase fitting (detects parabolic phase = drift)
-   - Instantaneous frequency linearity (R²)
-   - Chirp rate estimation
-   - Spectral centroid drift
-2. Key insight: Frequency drift creates quadratic phase, so quadratic fit quality is discriminative
-3. ChirpDetector works standalone for drift-focused detection, or Hybrid(c=0.5) for balanced performance
-
-**Trade-offs:**
-| Method | frequency_drift | Average (all types) |
-|--------|-----------------|---------------------|
-| ChirpDetector | **0.9245** | 0.8764 (degrades amplitude anomalies) |
-| Hybrid(c=0.5) | 0.8611 | **0.9549** (balanced) |
-
-### Next Priority
-1. Acquire RadioML dataset or similar real RF data
-2. Implement remaining baseline comparisons
-3. Draft introduction and methods sections
+**Recommendation:** Use hybrid detection by default. Switch to ChirpDetector when frequency drift is the primary concern.

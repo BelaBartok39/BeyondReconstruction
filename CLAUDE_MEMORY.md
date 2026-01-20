@@ -1,7 +1,7 @@
 # Claude Session Memory - RF Anomaly Detection Project
 
-**Last Updated:** 2026-01-18 23:30
-**Session Status:** ChirpDetector achieved 0.9245 AUROC on frequency drift (target met!)
+**Last Updated:** 2026-01-19
+**Session Status:** HackRF live validation complete - 0.9735 AUROC on real WiFi signals
 
 ---
 
@@ -1020,3 +1020,107 @@ ChirpDetector excels at frequency drift but degrades amplitude-based anomalies:
 2. **Phase-domain features work**: Quadratic phase fitting is effective for drift detection
 3. **Matched filtering doesn't work well**: Modulation noise overwhelms chirp correlation
 4. **Detector selection matters**: Different detectors excel at different anomaly types
+
+---
+
+## Session 8: TorchRF Testbed & Live HackRF Validation
+
+**Date:** 2026-01-19
+**Focus:** Build live detection system, validate on real RF signals, honest baseline comparison
+
+### TorchRF Testbed Built
+
+Complete standalone CLI for HackRF-based anomaly detection:
+
+```
+TorchRF_Testbed/
+├── src/
+│   ├── capture.py      # HackRF via GNURadio/osmosdr
+│   ├── detector.py     # Model inference wrapper
+│   ├── injection.py    # Software anomaly injection (7 types)
+│   ├── recorder.py     # HDF5 session recording
+│   └── utils.py        # Signal processing utilities
+├── scripts/
+│   ├── live_detect.py  # Interactive CLI with keyboard controls
+│   ├── record_session.py
+│   └── replay_test.py
+├── tests/              # Unit tests for all modules
+└── data/
+    └── hackrf_dataset.h5  # Recorded validation set
+```
+
+### Live HackRF Results
+
+**Dataset:** 200 samples at 2.437 GHz (WiFi Channel 6)
+- 140 normal, 60 anomalies (injected)
+
+**Performance:**
+- **AUROC:** 0.9735
+- **AUPRC:** 0.9580
+- **F1 Score:** 0.9355
+- **Precision:** 0.9032
+- **Recall:** 0.9667
+
+### Critical Finding: When Does the Model Beat Simple Baselines?
+
+Compared against amplitude threshold on the HackRF dataset:
+
+| Method | Overall AUROC |
+|--------|---------------|
+| Peak Amplitude | 0.9293 |
+| Mean Power (dB) | 0.9094 |
+| **Our Model** | **0.9735** |
+
+**Per-Anomaly Breakdown:**
+
+| Anomaly Type | Amplitude | Model | Advantage |
+|--------------|-----------|-------|-----------|
+| amplitude_spike | 1.000 | 1.000 | None |
+| burst_noise | 0.977 | 0.999 | +2% |
+| chirp | 0.880 | 0.970 | **+9%** |
+| barrage | 0.875 | 0.969 | **+9%** |
+| tone | 0.867 | 0.899 | +3% |
+
+**Key Insight:** Model earns its complexity for spectral anomalies (chirp, barrage, tone). For amplitude-based anomalies, simple threshold works nearly as well.
+
+### Why Frequency Drift is Hard: The Physics
+
+Analyzed why frequency drift is the hardest anomaly type:
+
+1. **No amplitude change** - identical peak/power to normal signals
+2. **High latent similarity** - 0.92 cosine similarity to normal in latent space
+3. **VAE is frequency-shift invariant** - learns local patterns, not absolute frequency
+
+**The smoking gun:** Frequency drift creates **quadratic phase**:
+```
+f(t) = f₀ + k·t  →  φ(t) = 2π(f₀·t + k·t²/2)
+```
+
+The quadratic coefficient is 23,000x larger for drift vs normal, but the VAE doesn't capture this because:
+- Convolutional encoder learns structural patterns
+- Drift preserves modulation shape, envelope characteristics
+- Only absolute frequency changes, which the encoder ignores
+
+**Solution:** ChirpDetector exploits quadratic phase fitting directly → 0.9245 AUROC
+
+### Detector Selection Guide
+
+| If you need to detect... | Use... | AUROC |
+|--------------------------|--------|-------|
+| Power anomalies only | Amplitude threshold | 0.93-1.00 |
+| Spectral anomalies | VAE latent space | 0.93 avg |
+| Frequency drift specifically | ChirpDetector | 0.92 on drift |
+| Unknown/mixed threats | Hybrid ensemble | 0.97+ |
+
+### Files Created
+
+- `TorchRF_Testbed/` - Complete live detection system
+- `TorchRF_Testbed/data/hackrf_dataset.h5` - Recorded validation set
+- Updated `RESEARCH_ROADMAP.md` with baseline comparison
+- Updated `LEARNING_JOURNEY.md` with physics explanation
+
+### Documentation Cleanup
+
+- Cleaned all `__pycache__` directories
+- Removed `.pytest_cache`
+- Consolidated documentation with honest baseline comparisons

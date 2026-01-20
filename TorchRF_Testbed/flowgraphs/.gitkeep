@@ -1,0 +1,5 @@
+# Placeholder for GNURadio Companion flowgraphs
+#
+# The hackrf_source.grc file can be created using GNURadio Companion
+# for visual flowgraph editing. The Python capture code in src/capture.py
+# implements the same functionality programmatically.
