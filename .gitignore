@@ -41,3 +41,12 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Checkpoint epoch files (keep only best_model.pt)
+checkpoints/**/checkpoint_epoch_*.pt
+
+# PDFs (store externally)
+*.pdf
+
+# Large model files (uncomment to ignore all .pt files)
+# *.pt

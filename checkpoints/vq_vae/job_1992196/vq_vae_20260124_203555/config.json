@@ -1,0 +1,25 @@
+{
+  "model": {
+    "type": "vq_vae",
+    "latent_dim": 32,
+    "num_embeddings": 512,
+    "commitment_cost": 0.25,
+    "hidden_channels": [
+      32,
+      64,
+      128,
+      256
+    ],
+    "use_power_conditioning": true
+  },
+  "training": {
+    "num_epochs": 250,
+    "batch_size": 64,
+    "learning_rate": 0.0003
+  },
+  "data": {
+    "sequence_length": 1024,
+    "num_train_samples": 10000,
+    "anomaly_severity": 4.0
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "timestamp": "2026-01-25T00:30:13.167426",
+  "synthetic": {
+    "v1": {
+      "latent_auroc": 0.9218875,
+      "hybrid_auroc": 0.94993125
+    },
+    "v2": {
+      "latent_auroc": 0.9186687499999998,
+      "hybrid_auroc": 0.9416796875
+    }
+  },
+  "powder": {
+    "v1": {
+      "latent_auroc": 0.7173609523809523,
+      "hybrid_auroc": 0.8745762698412698
+    },
+    "v2": {
+      "latent_auroc": 0.7272806349206349,
+      "hybrid_auroc": 0.8660955555555556
+    }
+  },
+  "hackrf": {
+    "v1": {
+      "latent_auroc": 0.8448979591836734
+    },
+    "v2": {
+      "latent_auroc": 0.8630952380952381
+    }
+  },
+  "per_anomaly": {
+    "frequency_drift": {
+      "v1": {
+        "latent_auroc": 0.7909111111111111,
+        "hybrid_auroc": 0.8774777777777777
+      },
+      "v2": {
+        "latent_auroc": 0.7478444444444444,
+        "hybrid_auroc": 0.8593111111111111
+      }
+    },
+    "interference": {
+      "v1": {
+        "latent_auroc": 0.8959333333333334,
+        "hybrid_auroc": 0.9629555555555557
+      },
+      "v2": {
+        "latent_auroc": 0.9204666666666667,
+        "hybrid_auroc": 0.9724777777777778
+      }
+    },
+    "amplitude_spike": {
+      "v1": {
+        "latent_auroc": 1.0,
+        "hybrid_auroc": 0.9897777777777778
+      },
+      "v2": {
+        "latent_auroc": 1.0,
+        "hybrid_auroc": 0.9887777777777778
+      }
+    },
+    "phase_noise": {
+      "v1": {
+        "latent_auroc": 0.9522666666666666,
+        "hybrid_auroc": 0.9641666666666666
+      },
+      "v2": {
+        "latent_auroc": 0.9537333333333333,
+        "hybrid_auroc": 0.9661666666666666
+      }
+    }
+  }
+}

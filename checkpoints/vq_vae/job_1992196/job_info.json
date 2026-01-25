@@ -1,0 +1,9 @@
+{
+    "job_id": "1992196",
+    "node": "ig01",
+    "start_time": "2026-01-24T20:37:29-06:00",
+    "config": "configs/vq_vae.yaml",
+    "epochs": 250,
+    "num_embeddings": 512,
+    "latent_dim": 32
+}

@@ -1,0 +1,97 @@
+# VQ-VAE Configuration for RF Anomaly Detection
+# Based on default.yaml with VQ-VAE specific parameters
+
+# Data settings (same as default)
+data:
+  sequence_length: 1024
+  sample_rate: 1e6
+  num_train_samples: 10000
+  num_val_samples: 2000
+  num_test_samples: 2000
+  anomaly_ratio: 0.2            # 20% anomalies for evaluation
+  snr_range: [-5, 30]
+  power_range: [-20, 10]
+  modulations:
+    - bpsk
+    - qpsk
+    - qam16
+  anomaly_types:
+    - interference
+    - frequency_drift
+    - amplitude_spike
+    - phase_noise
+    - burst_noise               # Include all 5 anomaly types
+  anomaly_severity: 4.0
+
+# VQ-VAE Model settings
+model:
+  type: "vq_vae"
+  latent_dim: 32                # Embedding dimension (D)
+  num_embeddings: 512           # Codebook size (K) - 512 codes
+  hidden_channels: [32, 64, 128, 256]
+  kernel_size: 7
+  use_batch_norm: true
+  dropout: 0.1
+  snr_embedding_dim: 16
+  use_power_conditioning: true  # Critical for amplitude anomalies
+
+  # VQ-specific parameters
+  commitment_cost: 0.25         # Beta in VQ-VAE loss (commitment weight)
+  vq_decay: 0.99                # EMA decay for codebook updates
+
+# Training settings (extended for VQ-VAE)
+training:
+  batch_size: 64
+  learning_rate: 3e-4           # Slightly lower for VQ-VAE stability
+  weight_decay: 1e-5
+  num_epochs: 250               # Extended training
+  early_stopping_patience: 25   # More patience for VQ-VAE
+  gradient_clip_norm: 1.0
+  scheduler:
+    type: "cosine"
+    T_max: 250                  # Match num_epochs
+    min_lr: 1e-6
+
+  # VQ-VAE specific
+  warmup_epochs: 10             # Warmup for codebook initialization
+
+# Continuous learning settings (same as default)
+continuous_learning:
+  online:
+    enabled: true
+    learning_rate: 1e-4
+    update_frequency: 1
+  ewc:
+    enabled: true
+    lambda: 1000.0
+    fisher_samples: 1000
+  ucl:
+    enabled: false
+  periodic:
+    enabled: true
+    interval: 1000
+    epochs_per_retrain: 5
+  replay:
+    buffer_size: 5000
+    sample_strategy: "reservoir"
+    replay_batch_ratio: 0.5
+
+# Anomaly detection settings
+detection:
+  method: "latent"              # Will use quantization distance + latent
+  threshold_method: "percentile"
+  threshold_percentile: 95
+  snr_adaptive: true
+  snr_bins: 7
+  invert_scores: false
+  hybrid_weights: [0.3, 0.7]    # [recon, quantization]
+  scoring_method: "mse"
+
+# Experiment settings
+experiment:
+  seed: 42
+  device: "auto"
+  num_workers: 4
+  save_dir: "checkpoints/vq_vae"
+  log_interval: 100
+  checkpoint_interval: 10

@@ -18,12 +18,14 @@ REMOTE_DIR="~/CLP_Project"
 SSH_OPTS="-i $SSH_KEY"
 RSYNC_OPTS="-avz --progress -e \"ssh $SSH_OPTS\""
 
-# Exclusions for push (don't overwrite cluster data)
+# Exclusions for push (don't overwrite cluster data or push large files)
 PUSH_EXCLUDE="--exclude='.git' --exclude='*.pyc' --exclude='__pycache__' \
               --exclude='.pytest_cache' --exclude='*.egg-info' \
               --exclude='checkpoints/' --exclude='logs/' --exclude='results/' \
               --exclude='.venv' --exclude='venv' --exclude='*.pt' \
-              --exclude='wandb/' --exclude='.ipynb_checkpoints'"
+              --exclude='wandb/' --exclude='.ipynb_checkpoints' \
+              --exclude='RED_DATA/' --exclude='TorchRF_Testbed/data/' \
+              --exclude='*.h5' --exclude='*.hdf5' --exclude='figures/'"
 
 # Exclusions for pull (only get results)
 PULL_INCLUDE="--include='checkpoints/***' --include='logs/***' --include='results/***' \
