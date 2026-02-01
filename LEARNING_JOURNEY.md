@@ -756,6 +756,28 @@ This finding strengthens our paper significantly:
 
 ---
 
+## Paper Revision + Coffee Shop Capture Session (2026-02-01)
+
+### What Happened
+
+Addressed 5 reviewer critiques on the IEEE paper, then went to a coffee shop with the HackRF to expand the real-world dataset from 200 to 1,700 samples.
+
+### Key Discovery: Cross-Band Generalization
+
+The model, trained entirely on synthetic data, achieved **0.9969 AUROC on 5 GHz WiFi** — a frequency band it never saw during training. This demonstrates the CNN encoder learns structural signal properties (modulation patterns, anomaly signatures) rather than frequency-specific features.
+
+| Environment | Band | Samples | Best AUROC |
+|-------------|------|---------|------------|
+| Residential (home) | 2.4 GHz | 200 | 0.845 |
+| Commercial (coffee shop) | 2.4 GHz | 1,000 | 0.983 |
+| Commercial (coffee shop) | 5 GHz | 500 | **0.997** |
+
+### Lesson Learned
+
+> **Data collection in diverse environments is worth more than architectural complexity.** The jump from 0.845 (home) to 0.983 (coffee shop) isn't because the model improved — it's because denser WiFi traffic creates cleaner normal baselines. And cross-band validation (5 GHz) is a stronger generalization claim than any synthetic experiment.
+
+---
+
 *Document created: January 2026*
 *Research collaboration with Claude (Anthropic)*
-*Last validated: 2026-01-20 (Literature review completed)*
+*Last validated: 2026-02-01 (Paper revision + coffee shop captures)*

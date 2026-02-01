@@ -1,6 +1,6 @@
 # Research Roadmap for Academic Publishing
 
-**Last Updated:** 2026-01-20 (Literature review added)
+**Last Updated:** 2026-02-01 (Paper revision + coffee shop HackRF captures)
 
 ## Current State Summary
 
@@ -211,9 +211,26 @@ TorchRF_Testbed/
 
 ---
 
-### Phase 4: Paper Writing (2-3 weeks)
+### Phase 4: Paper Writing
+**Status: IN REVISION**
 
-#### 4.1 Target Venues
+#### 4.1 Paper Revision (2026-02-01)
+
+Addressed five reviewer critiques in `main.tex`:
+
+- [x] **ChirpDetector documentation**: 12-feature table, 4-stage extraction pipeline, scoring formula
+- [x] **Alpha sensitivity**: Table showing stability across α ∈ [0.3, 0.7] (AUROC range: 0.019)
+- [x] **HackRF expansion**: 1,700 captures across 2 environments, 2 bands (2.4 + 5 GHz)
+- [x] **Statistical significance**: 95% bootstrap CIs and Wilcoxon p-values added
+- [x] **Novelty claim tightened**: "A novel combination of SNR/power-conditioned VAE..."
+
+**Coffee shop capture session (2026-02-01):**
+- 1,000 samples at 2.4 GHz (commercial WiFi environment)
+- 500 samples at 5 GHz (cross-band validation)
+- Results: 0.97–0.99 AUROC (2.4 GHz), 0.9969 AUROC (5 GHz cross-band)
+- Cross-band generalization without retraining is the strongest new finding
+
+#### 4.2 Target Venues
 
 | Venue | Focus | Deadline |
 |-------|-------|----------|
