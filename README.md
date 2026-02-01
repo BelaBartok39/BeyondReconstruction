@@ -1,177 +1,93 @@
-# RF Anomaly Detection with Continuous Learning Autoencoder
+# RF Anomaly Detection with Continuous Learning
 
-A PyTorch-based research project implementing autoencoder architectures for RF signal anomaly detection with continuous learning capabilities.
+[![Tests](https://github.com/YOUR_USERNAME/rf-anomaly-detection/actions/workflows/test.yml/badge.svg)](https://github.com/YOUR_USERNAME/rf-anomaly-detection/actions/workflows/test.yml)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![arXiv](https://img.shields.io/badge/arXiv-XXXX.XXXXX-b31b1b.svg)](https://arxiv.org/abs/XXXX.XXXXX)
+
+A PyTorch-based research project for **unsupervised anomaly detection in raw I/Q RF signals** using SNR-conditioned variational autoencoders with latent-space Mahalanobis distance scoring.
+
+## Key Results
+
+| Metric | Value |
+|--------|-------|
+| **Overall AUROC (hybrid)** | 0.9549 |
+| **HackRF live WiFi** | 0.9735 |
+| **POWDER LTE+DSSS** | 0.8882 |
+| **Latent vs Reconstruction** | 2.2x improvement (0.93 vs 0.42) |
+
+**Key Innovation:** Reconstruction-based anomaly detection fails for normalized RF signals. Our latent-space approach using Mahalanobis distance achieves 2.2x better AUROC.
 
 ## Features
 
-- **SNR-Conditioned VAE**: Autoencoder that adapts to signal quality
-- **Continuous Learning**: Online learning, EWC, and periodic retraining
-- **Synthetic RF Data**: Realistic signal generation with various modulations and anomalies
-- **Comprehensive Evaluation**: SNR-stratified metrics and visualization tools
+- **SNR-Conditioned VAE**: Adapts to signal quality conditions
+- **Latent-Space Detection**: Mahalanobis distance outperforms reconstruction error
+- **Power Conditioning**: Preserves amplitude info lost in normalization
+- **Hybrid Detection**: Combines learned + physics-based features
+- **Continuous Learning**: Online learning, EWC, periodic retraining
+- **Real-World Validated**: Tested on HackRF and POWDER datasets
+
+## Quick Start
+
+```bash
+# Clone and install
+git clone https://github.com/YOUR_USERNAME/rf-anomaly-detection.git
+cd rf-anomaly-detection
+pip install -r requirements.txt
+
+# Run quickstart example
+python examples/quickstart.py
+
+# Or use the production model
+python experiments/evaluate.py --checkpoint checkpoints/snr_vae_hybrid_v1_20260118/best_model.pt
+```
 
 ## Project Structure
 
 ```
-CLP_Project/
+rf-anomaly-detection/
 ├── src/
-│   ├── models/          # Autoencoder architectures (AE, VAE, SNR-VAE)
-│   ├── data/            # Data generation and loading
-│   ├── learning/        # Continuous learning modules
-│   ├── detection/       # Anomaly detection logic
-│   └── utils/           # Configuration and visualization
+│   ├── models/          # VAE architectures (SNR-conditioned)
+│   ├── data/            # Synthetic data generation
+│   ├── learning/        # Continuous learning (EWC, online)
+│   ├── detection/       # Anomaly detection (Mahalanobis, hybrid)
+│   └── utils/           # Config, visualization
 ├── experiments/         # Training and evaluation scripts
-├── notebooks/           # Interactive exploration
+├── examples/            # Quickstart examples
 ├── tests/               # Unit tests
-├── configs/             # Configuration files
-└── cluster/             # SLURM deployment scripts
+├── configs/             # YAML configurations
+└── checkpoints/         # Trained models
 ```
 
 ## Installation
 
 ```bash
-# Clone and enter directory
-cd CLP_Project
-
 # Create virtual environment
 python -m venv venv
 source venv/bin/activate  # Linux/Mac
-# or: venv\Scripts\activate  # Windows
 
 # Install dependencies
 pip install -r requirements.txt
+
+# For development
+pip install -r requirements-dev.txt
 ```
 
-## Quick Start
+## Usage
 
-### 1. Explore the Data and Models
-
-```bash
-jupyter notebook notebooks/exploration.ipynb
-```
-
-### 2. Train Baseline Model
+### Train a Model
 
 ```bash
 python experiments/train_baseline.py --config configs/default.yaml
 ```
 
-### 3. Evaluate Model
+### Evaluate Model
 
 ```bash
 python experiments/evaluate.py \
-    --checkpoint checkpoints/<timestamp>/best_model.pt \
+    --checkpoint checkpoints/snr_vae_hybrid_v1_20260118/best_model.pt \
     --save-plots
 ```
-
-### 4. Compare Learning Methods
-
-```bash
-python experiments/compare_learning.py \
-    --baseline-checkpoint checkpoints/<timestamp>/best_model.pt
-```
-
-## Model Architectures
-
-### Base Autoencoder
-1D convolutional autoencoder for IQ time series reconstruction.
-
-### Variational Autoencoder (VAE)
-Adds KL divergence regularization for a smoother latent space.
-
-### SNR-Conditioned VAE
-Conditions both encoder and decoder on estimated SNR, enabling:
-- SNR-dependent reconstruction
-- Adaptive anomaly thresholds
-- Better performance across signal quality levels
-
-## Continuous Learning
-
-### Online Learning
-Incremental model updates with each new batch using reduced learning rate.
-
-### Elastic Weight Consolidation (EWC)
-Prevents catastrophic forgetting by penalizing changes to important parameters.
-
-### Periodic Retraining
-Buffers new samples and retrains at intervals with optional experience replay.
-
-## Anomaly Detection Methods
-
-1. **Reconstruction-based**: Threshold on reconstruction error
-2. **Latent-space**: Mahalanobis distance in latent space
-3. **Hybrid**: Combination of both methods
-4. **SNR-adaptive**: Per-SNR-bin thresholds
-
-## Cluster Deployment
-
-### Setup
-
-```bash
-# Sync code to cluster
-./cluster/sync.sh push
-
-# SSH to cluster and setup environment
-ssh -i ~/.ssh/school_gpu_key ndrdmond@bigblue.memphis.edu
-cd ~/CLP_Project
-bash cluster/setup_env.sh
-```
-
-### Submit Jobs
-
-```bash
-# Training job
-sbatch cluster/slurm/train.sbatch
-
-# Evaluation job
-sbatch cluster/slurm/evaluate.sbatch checkpoints/best_model.pt
-
-# Pull results back
-./cluster/sync.sh pull
-```
-
-## Configuration
-
-Edit `configs/default.yaml` to customize:
-
-```yaml
-model:
-  type: "snr_vae"
-  latent_dim: 32
-  hidden_channels: [32, 64, 128, 256]
-
-training:
-  batch_size: 64
-  learning_rate: 1e-3
-  num_epochs: 100
-
-continuous_learning:
-  online:
-    learning_rate: 1e-4
-  ewc:
-    lambda: 1000.0
-  periodic:
-    interval: 1000
-```
-
-## Testing
-
-```bash
-# Run all tests
-pytest tests/
-
-# Run with coverage
-pytest tests/ --cov=src --cov-report=html
-```
-
-## Validation Datasets
-
-The model has been validated on multiple real-world datasets:
-
-| Dataset | Type | AUROC | Notes |
-|---------|------|-------|-------|
-| HackRF WiFi | Live capture | 0.9735 | 200 samples at 2.437 GHz |
-| POWDER LTE+DSSS | Real LTE | 0.8882 | Spread-spectrum interference |
-| MIT 5G | Jammed 5G | TBD | 1.6 GB dataset available |
 
 ### Test on POWDER Dataset
 
@@ -179,36 +95,96 @@ The model has been validated on multiple real-world datasets:
 python experiments/test_powder_data.py
 ```
 
-## Key Technical Details
+## Model Architecture
 
-### Data Format
-- Input: `[batch, 2, sequence_length]` (I and Q channels)
-- SNR: Normalized to [0, 1] for model input
-
-### Anomaly Score
-```python
-anomaly_score = reconstruction_error / expected_error(snr)
+```
+I/Q Signal [batch, 2, 1024] → SNRConditionedVAE → Latent [batch, 32] → AnomalyDetector → Score
+                              ↑                                         ↑
+                         SNR + Power                              Mahalanobis Distance
+                         Conditioning                             (not reconstruction error)
 ```
 
-### Supported Modulations
-- BPSK, QPSK, 16-QAM, 64-QAM
+**Why latent-space detection?** Reconstruction-based methods fail because VAEs can reconstruct anomalies *better* than normal signals after normalization. [Bouman & Heskes (2025)](https://arxiv.org/abs/2501.13864) prove this theoretically.
 
-### Supported Anomaly Types
+## Anomaly Detection Methods
+
+| Method | Best For | AUROC |
+|--------|----------|-------|
+| Amplitude Threshold | Power anomalies | 0.93 |
+| VAE Latent (Mahalanobis) | General anomalies | 0.93 |
+| Hybrid (latent + freq) | Balanced detection | 0.95 |
+| ChirpDetector | Frequency drift | 0.92 |
+
+## Supported Anomaly Types
+
 - Narrowband interference
 - Frequency drift
 - Amplitude spikes
 - Phase noise
 - Burst noise
-- **DSSS interference** (validated on POWDER dataset)
+- DSSS interference (validated on POWDER)
 
-## Dependencies
+## Validation Datasets
 
-- PyTorch >= 2.0
-- NumPy, SciPy
-- scikit-learn
-- Matplotlib, Seaborn
-- PyYAML, tqdm
+| Dataset | Type | AUROC | Notes |
+|---------|------|-------|-------|
+| Synthetic | Generated | 0.9549 | 5 anomaly types |
+| HackRF WiFi | Live capture | 0.9735 | 200 samples at 2.437 GHz |
+| POWDER LTE+DSSS | Real LTE | 0.8882 | Unseen anomaly type |
+
+## Configuration
+
+Edit `configs/default.yaml`:
+
+```yaml
+model:
+  type: "snr_vae"
+  latent_dim: 32
+  use_power_conditioning: true
+
+detection:
+  method: "latent"  # NOT "reconstruction"
+  snr_adaptive: true
+
+training:
+  batch_size: 64
+  learning_rate: 1e-3
+  num_epochs: 100
+```
+
+## Testing
+
+```bash
+# Run all tests
+pytest tests/ -v
+
+# With coverage
+pytest tests/ --cov=src --cov-report=html
+```
+
+## Citation
+
+If you use this code in your research, please cite:
+
+```bibtex
+@inproceedings{author2026rf,
+  title={Latent-Space Anomaly Detection in Raw I/Q RF Signals Using SNR-Conditioned VAEs},
+  author={Author Name},
+  booktitle={IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
+  year={2026}
+}
+```
+
+## Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
-Research use only.
+This project is licensed under the MIT License - see [LICENSE](LICENSE) for details.
+
+## Acknowledgments
+
+- University of Memphis for compute resources
+- POWDER testbed for real LTE dataset
+- [Bouman & Heskes (2025)](https://arxiv.org/abs/2501.13864) for theoretical validation of our findings

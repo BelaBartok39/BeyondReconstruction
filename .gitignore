@@ -1,7 +1,20 @@
-# Datasets (large files)
-RED_DATA/
+# =============================================================================
+# RF Anomaly Detection - .gitignore
+# =============================================================================
 
+# -----------------------------------------------------------------------------
+# Datasets (large files - store on HuggingFace)
+# -----------------------------------------------------------------------------
+RED_DATA/
+data/raw/
+data/processed/
+*.h5
+*.hdf5
+!data/examples/*.h5
+
+# -----------------------------------------------------------------------------
 # Python
+# -----------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
@@ -11,42 +24,94 @@ __pycache__/
 .eggs/
 dist/
 build/
+pip-wheel-metadata/
 
 # Virtual environments
 venv/
 .venv/
 env/
+ENV/
 
-# IDE
+# -----------------------------------------------------------------------------
+# IDE / Editor
+# -----------------------------------------------------------------------------
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
+.spyderproject
+.spyproject
 
+# -----------------------------------------------------------------------------
 # Jupyter
+# -----------------------------------------------------------------------------
 .ipynb_checkpoints/
+*.ipynb_checkpoints
 
-# Testing
+# -----------------------------------------------------------------------------
+# Testing / Coverage
+# -----------------------------------------------------------------------------
 .pytest_cache/
 .coverage
+.coverage.*
 htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
 
-# Model checkpoints (optional - uncomment if you don't want to track)
+# -----------------------------------------------------------------------------
+# Model Checkpoints
+# -----------------------------------------------------------------------------
+# Keep production model, ignore training intermediates
+checkpoints/**/checkpoint_epoch_*.pt
+checkpoints/**/latest_model.pt
+# Uncomment to ignore all checkpoints except production:
 # checkpoints/
+# !checkpoints/snr_vae_hybrid_v1_*/best_model.pt
+# !checkpoints/snr_vae_hybrid_v2_*/best_model.pt
 
-# Logs
+# -----------------------------------------------------------------------------
+# Logs and Outputs
+# -----------------------------------------------------------------------------
 *.log
 logs/
+wandb/
+mlruns/
+tensorboard_logs/
 
-# OS
+# -----------------------------------------------------------------------------
+# OS Generated
+# -----------------------------------------------------------------------------
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
+desktop.ini
 
-# Checkpoint epoch files (keep only best_model.pt)
-checkpoints/**/checkpoint_epoch_*.pt
+# -----------------------------------------------------------------------------
+# Secrets and Credentials (safety)
+# -----------------------------------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+secrets.yaml
+credentials.json
 
-# PDFs (store externally)
+# -----------------------------------------------------------------------------
+# Cluster / HPC
+# -----------------------------------------------------------------------------
+slurm-*.out
+*.slurm.out
+
+# -----------------------------------------------------------------------------
+# Misc
+# -----------------------------------------------------------------------------
 *.pdf
-
-# Large model files (uncomment to ignore all .pt files)
-# *.pt
+*.bak
+.claude/settings.local.json
