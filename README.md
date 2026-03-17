@@ -1,9 +1,8 @@
-# RF Anomaly Detection with Continuous Learning
+# BeyondReconstruction: RF Anomaly Detection with Continuous Learning
 
-[![Tests](https://github.com/YOUR_USERNAME/rf-anomaly-detection/actions/workflows/test.yml/badge.svg)](https://github.com/YOUR_USERNAME/rf-anomaly-detection/actions/workflows/test.yml)
+[![Tests](https://github.com/BelaBartok39/BeyondReconstruction/actions/workflows/test.yml/badge.svg)](https://github.com/BelaBartok39/BeyondReconstruction/actions/workflows/test.yml)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![arXiv](https://img.shields.io/badge/arXiv-XXXX.XXXXX-b31b1b.svg)](https://arxiv.org/abs/XXXX.XXXXX)
 
 A PyTorch-based research project for **unsupervised anomaly detection in raw I/Q RF signals** using SNR-conditioned variational autoencoders with latent-space Mahalanobis distance scoring.
 
@@ -31,8 +30,8 @@ A PyTorch-based research project for **unsupervised anomaly detection in raw I/Q
 
 ```bash
 # Clone and install
-git clone https://github.com/YOUR_USERNAME/rf-anomaly-detection.git
-cd rf-anomaly-detection
+git clone https://github.com/BelaBartok39/BeyondReconstruction.git
+cd BeyondReconstruction
 pip install -r requirements.txt
 
 # Run quickstart example
@@ -45,7 +44,7 @@ python experiments/evaluate.py --checkpoint checkpoints/snr_vae_hybrid_v1_202601
 ## Project Structure
 
 ```
-rf-anomaly-detection/
+BeyondReconstruction/
 ├── src/
 │   ├── models/          # VAE architectures (SNR-conditioned)
 │   ├── data/            # Synthetic data generation
@@ -167,9 +166,9 @@ pytest tests/ --cov=src --cov-report=html
 If you use this code in your research, please cite:
 
 ```bibtex
-@inproceedings{author2026rf,
+@inproceedings{bartok2026rf,
   title={Latent-Space Anomaly Detection in Raw I/Q RF Signals Using SNR-Conditioned VAEs},
-  author={Author Name},
+  author={LastName, FirstName},
   booktitle={IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
   year={2026}
 }
