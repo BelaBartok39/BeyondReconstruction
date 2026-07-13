@@ -15,8 +15,6 @@ A PyTorch-based research project for **unsupervised anomaly detection in raw I/Q
 | **POWDER LTE+DSSS** | 0.8882 |
 | **Latent vs Reconstruction** | 2.2x improvement (0.93 vs 0.42) |
 
-**Key Innovation:** Reconstruction-based anomaly detection fails for normalized RF signals. Our latent-space approach using Mahalanobis distance achieves 2.2x better AUROC.
-
 ## Features
 
 - **SNR-Conditioned VAE**: Adapts to signal quality conditions
@@ -25,74 +23,6 @@ A PyTorch-based research project for **unsupervised anomaly detection in raw I/Q
 - **Hybrid Detection**: Combines learned + physics-based features
 - **Continuous Learning**: Online learning, EWC, periodic retraining
 - **Real-World Validated**: Tested on HackRF and POWDER datasets
-
-## Quick Start
-
-```bash
-# Clone and install
-git clone https://github.com/YOUR_USERNAME/rf-anomaly-detection.git
-cd rf-anomaly-detection
-pip install -r requirements.txt
-
-# Run quickstart example
-python examples/quickstart.py
-
-# Or use the production model
-python experiments/evaluate.py --checkpoint checkpoints/snr_vae_hybrid_v1_20260118/best_model.pt
-```
-
-## Project Structure
-
-```
-rf-anomaly-detection/
-├── src/
-│   ├── models/          # VAE architectures (SNR-conditioned)
-│   ├── data/            # Synthetic data generation
-│   ├── learning/        # Continuous learning (EWC, online)
-│   ├── detection/       # Anomaly detection (Mahalanobis, hybrid)
-│   └── utils/           # Config, visualization
-├── experiments/         # Training and evaluation scripts
-├── examples/            # Quickstart examples
-├── tests/               # Unit tests
-├── configs/             # YAML configurations
-└── checkpoints/         # Trained models
-```
-
-## Installation
-
-```bash
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-
-# Install dependencies
-pip install -r requirements.txt
-
-# For development
-pip install -r requirements-dev.txt
-```
-
-## Usage
-
-### Train a Model
-
-```bash
-python experiments/train_baseline.py --config configs/default.yaml
-```
-
-### Evaluate Model
-
-```bash
-python experiments/evaluate.py \
-    --checkpoint checkpoints/snr_vae_hybrid_v1_20260118/best_model.pt \
-    --save-plots
-```
-
-### Test on POWDER Dataset
-
-```bash
-python experiments/test_powder_data.py
-```
 
 ## Model Architecture
 
@@ -131,35 +61,6 @@ I/Q Signal [batch, 2, 1024] → SNRConditionedVAE → Latent [batch, 32] → Ano
 | HackRF WiFi | Live capture | 0.9735 | 200 samples at 2.437 GHz |
 | POWDER LTE+DSSS | Real LTE | 0.8882 | Unseen anomaly type |
 
-## Configuration
-
-Edit `configs/default.yaml`:
-
-```yaml
-model:
-  type: "snr_vae"
-  latent_dim: 32
-  use_power_conditioning: true
-
-detection:
-  method: "latent"  # NOT "reconstruction"
-  snr_adaptive: true
-
-training:
-  batch_size: 64
-  learning_rate: 1e-3
-  num_epochs: 100
-```
-
-## Testing
-
-```bash
-# Run all tests
-pytest tests/ -v
-
-# With coverage
-pytest tests/ --cov=src --cov-report=html
-```
 
 ## Contributing
 
