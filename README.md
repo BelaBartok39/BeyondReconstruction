@@ -1,6 +1,5 @@
 # RF Anomaly Detection with Continuous Learning
 
-[![Tests](https://github.com/YOUR_USERNAME/rf-anomaly-detection/actions/workflows/test.yml/badge.svg)](https://github.com/YOUR_USERNAME/rf-anomaly-detection/actions/workflows/test.yml)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![arXiv](https://img.shields.io/badge/arXiv-XXXX.XXXXX-b31b1b.svg)](https://arxiv.org/abs/XXXX.XXXXX)
