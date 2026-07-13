@@ -162,19 +162,6 @@ pytest tests/ -v
 pytest tests/ --cov=src --cov-report=html
 ```
 
-## Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-@inproceedings{author2026rf,
-  title={Latent-Space Anomaly Detection in Raw I/Q RF Signals Using SNR-Conditioned VAEs},
-  author={Author Name},
-  booktitle={IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
-  year={2026}
-}
-```
-
 ## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
@@ -185,6 +172,5 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) for deta
 
 ## Acknowledgments
 
-- University of Memphis for compute resources
-- POWDER testbed for real LTE dataset
-- [Bouman & Heskes (2025)](https://arxiv.org/abs/2501.13864) for theoretical validation of our findings
+- University of Memphis for compute resources. 
+
